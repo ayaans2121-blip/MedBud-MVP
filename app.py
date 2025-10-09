@@ -1,5 +1,5 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, make_response
-import time, random, os, sqlite3, uuid
+from flask import Flask, render_template_string, request, redirect, url_for, session, make_response, jsonify
+import time, random, os, sqlite3, uuid, math
 from datetime import datetime
 
 app = Flask(__name__)
@@ -104,111 +104,135 @@ def gate():
     </body></html>
     """, error=error)
 
-# ======================= Question Bank =======================
-QUESTIONS = {
-    "Anatomy": [
-        {"q":"A patient can’t abduct the right eye when looking to the right. Which nerve is most likely affected?",
-         "options":["Oculomotor (CN III)","Trochlear (CN IV)","Abducens (CN VI)","Optic (CN II)"],
-         "answer":"Abducens (CN VI)",
-         "explanation":"CN VI drives the lateral rectus — think “LR6”.",
-         "difficulty":"easy"},
-        {"q":"Sudden left facial droop and left arm weakness with aphasia. Which artery is most likely involved?",
-         "options":["ACA","MCA","PCA","Basilar"],
-         "answer":"MCA",
-         "explanation":"MCA = Face & upper limb + language.",
-         "difficulty":"medium"},
-        {"q":"Loss of pain/temperature on the left face with loss on the right body. This pattern localizes best to…",
-         "options":["Medial medulla","Lateral medulla","Midbrain tectum","Cervical dorsal column"],
-         "answer":"Lateral medulla",
-         "explanation":"Lateral medulla (PICA) = ipsi face + contra body loss.",
-         "difficulty":"hard"},
-        {"q":"Pupil is ‘down & out’ with ptosis on the right. Which structure is compressed in an uncal herniation?",
-         "options":["CN II","CN III","CN IV","CN VI"],
-         "answer":"CN III",
-         "explanation":"Uncal herniation compresses CN III.",
-         "difficulty":"medium"},
-        {"q":"A stroke causes difficulty recognizing objects by touch despite intact primary sensation. Which lobe?",
-         "options":["Frontal","Parietal","Temporal","Occipital"],
-         "answer":"Parietal",
-         "explanation":"Parietal lobe = stereognosis and sensory integration.",
-         "difficulty":"easy"}
-    ],
-    "Physiology": [
-        {"q":"What primarily sets the neuron’s resting membrane potential near −70 mV?",
-         "options":["Voltage-gated Na⁺ channels","K⁺ leak channels","Na⁺/Ca²⁺ exchanger","Cl⁻ channels"],
-         "answer":"K⁺ leak channels",
-         "explanation":"Leaky K⁺ bucket analogy.",
-         "difficulty":"easy"},
-        {"q":"Why does myelination speed conduction?",
-         "options":["Lowers threshold","Increases axon diameter only","Enables saltatory conduction","Adds more Na⁺ channels everywhere"],
-         "answer":"Enables saltatory conduction",
-         "explanation":"Saltatory = hop node-to-node.",
-         "difficulty":"easy"},
-        {"q":"Which change most increases axonal conduction velocity?",
-         "options":["↓ Axon diameter & ↓ myelination","↑ Axon diameter & ↑ myelination","↑ External Na⁺ only","↑ K⁺ leak only"],
-         "answer":"↑ Axon diameter & ↑ myelination",
-         "explanation":"Better insulation and thicker cable → faster.",
-         "difficulty":"medium"},
-        {"q":"At the NMJ, acetylcholine triggers depolarization primarily via which receptor?",
-         "options":["Nicotinic ionotropic receptor","Muscarinic M2","GABA-A","AMPA"],
-         "answer":"Nicotinic ionotropic receptor",
-         "explanation":"Nicotinic = fast ion channel → Na⁺ in, K⁺ out.",
-         "difficulty":"easy"},
-        {"q":"During the absolute refractory period, why can’t the neuron fire again?",
-         "options":["K⁺ channels are closed","Na⁺ channels are inactivated","Cl⁻ channels are open","Membrane is hyperexcitable"],
-         "answer":"Na⁺ channels are inactivated",
-         "explanation":"Na⁺ gates are locked; must reset.",
-         "difficulty":"medium"}
-    ],
-    "Pathophysiology": [
-        {"q":"A young woman has neurologic deficits that ‘flare with heat’ (Uhthoff). What’s the core lesion in MS?",
-         "options":["Axonal transection only","CNS demyelination","PNS demyelination","Synaptic vesicle defect"],
-         "answer":"CNS demyelination",
-         "explanation":"MS = CNS myelin loss → slower conduction.",
-         "difficulty":"easy"},
-        {"q":"Ptosis, diplopia worse at day’s end, improves with rest. Antibodies target…",
-         "options":["ACh receptor","Voltage-gated Ca²⁺ channel","MuSK","Dopamine receptor"],
-         "answer":"ACh receptor",
-         "explanation":"Myasthenia gravis = AChR antibodies.",
-         "difficulty":"medium"},
-        {"q":"Nonfluent speech, good comprehension, impaired repetition: most consistent with…",
-         "options":["Broca’s aphasia","Wernicke’s aphasia","Conduction aphasia","Global aphasia"],
-         "answer":"Broca’s aphasia",
-         "explanation":"Broca = broken speech, intact comprehension.",
-         "difficulty":"easy"},
-        {"q":"A trauma patient develops a unilateral ‘blown pupil’ and contralateral hemiparesis. Likely mechanism?",
-         "options":["Central herniation","Tonsillar herniation","Uncal herniation","Upward cerebellar herniation"],
-         "answer":"Uncal herniation",
-         "explanation":"Uncus compresses CN III + cerebral peduncle.",
-         "difficulty":"hard"},
-        {"q":"Elderly patient with memory loss and hippocampal atrophy. Which neurotransmitter is reduced?",
-         "options":["Dopamine","Serotonin","Acetylcholine","Glutamate"],
-         "answer":"Acetylcholine",
-         "explanation":"Alzheimer’s → ↓ ACh from basal nucleus.",
-         "difficulty":"medium"}
-    ]
-}
+# ======================= ENSO MVP: Daily Clinical Judgment Case =======================
 
-CYCLE_TOPICS = ["Anatomy", "Physiology", "Pathophysiology"]
 COOLDOWN_SECONDS = 20 * 60 * 60  # 20 hours
+FRIDAY_BOSS = True  # shows a harder case on Fridays
+
+# Minimal case schema (author-friendly)
+# Each case trains ONE "next best step" (nbs).
+CASES = [
+    {
+        "id": 1,
+        "topic": "ED – Chest Pain",
+        "level": "Intern",
+        "title": "Crushing chest pain in triage",
+        "stem": "45-year-old with 30 minutes of central, pressure-like chest pain, nauseated, diaphoretic, no known history.",
+        "history_options": [
+            {"key":"radiation", "label":"Ask about radiation/exertion/relief", "value":"+ to left arm; exertional; no relief with rest"},
+            {"key":"risk", "label":"Ask PMHx and risks", "value":"Smoker 20 pack-years; father had MI at 52"},
+            {"key":"gi", "label":"Ask reflux/meals", "value":"No clear relation to meals"}
+        ],
+        "exam": "Vitals: HR 98, BP 138/84, RR 18, SpO₂ 98%. Chest clear. No murmur.",
+        "nbs": {
+            "prompt":"What is the next best step?",
+            "options":[
+                {"id":"A","text":"Order CT pulmonary angiogram"},
+                {"id":"B","text":"Obtain ECG within 10 minutes","correct":True,"safety_critical":True},
+                {"id":"C","text":"Check troponin first, then ECG"},
+                {"id":"D","text":"Discharge with outpatient stress test"}
+            ]
+        },
+        "rationale_html": "<p><b>ECG first.</b> In suspected ACS, ECG within 10 minutes identifies ST-segment changes and guides immediate therapy. Troponin may be normal early and <i>must not</i> delay ECG. CT first delays lifesaving actions; outpatient workup is unsafe with red flags.</p>",
+        "pitfalls": [
+            "Ordering troponin before ECG (delays critical decision).",
+            "Going to CT first (misprioritises ACS over PE in this context).",
+            "Discharging despite red flags (exertional, diaphoresis, radiation)."
+        ],
+        "takeaways": [
+            "In chest pain with red flags, get ECG ≤10 minutes.",
+            "Treat as ACS until ruled out; tests complement, not precede ECG.",
+            "Prioritise time-critical actions before downstream imaging."
+        ],
+        "anz_ref": "RACGP Chest Pain 2023: ECG within 10 minutes for suspected ACS."
+    },
+    {
+        "id": 2,
+        "topic": "Gen Med – Sepsis screen",
+        "level": "Intern",
+        "title": "Shaking rigors on the ward",
+        "stem": "72-year-old with fever 38.9°C, rigors, hypotension (BP 92/58) 2 hours post-op hip fixation.",
+        "history_options": [
+            {"key":"focus", "label":"Ask likely source (surgical, lines, urine, lungs)", "value":"Surgical drain serosanguinous; foley present; mild cough"},
+            {"key":"abx", "label":"Allergies / prior antibiotics", "value":"No allergies; received cefazolin"},
+            {"key":"comorb", "label":"Comorbidities", "value":"DM2; CKD stage 3"}
+        ],
+        "exam": "T 38.9, HR 116, RR 24, SpO₂ 95% RA. Warm peripheries, GCS 15.",
+        "nbs": {
+            "prompt":"What is the next best step?",
+            "options":[
+                {"id":"A","text":"Pan-CT imaging then consider antibiotics"},
+                {"id":"B","text":"Immediate broad-spectrum IV antibiotics and fluids","correct":True,"safety_critical":True},
+                {"id":"C","text":"Wait for lactate and cultures before antibiotics"},
+                {"id":"D","text":"Start oral antibiotics and review in the morning"}
+            ]
+        },
+        "rationale_html": "<p><b>Early IV antibiotics + fluids now.</b> In suspected sepsis with hypotension and tachycardia, give timely broad-spectrum antibiotics after prompt cultures but <i>do not</i> delay antibiotics for labs/imaging. Early resuscitation reduces mortality.</p>",
+        "pitfalls": [
+            "Waiting for labs/cultures before antibiotics.",
+            "Sending patient to CT while unstable.",
+            "Treating with oral antibiotics in a hypotensive patient."
+        ],
+        "takeaways": [
+            "Sepsis bundle: cultures then immediate IV antibiotics + fluids.",
+            "Do not delay antibiotics for imaging in unstable patients.",
+            "Reassess response frequently; escalate early."
+        ],
+        "anz_ref": "ACSQHC Sepsis Clinical Care Standard (AU)."
+    },
+    {
+        "id": 3,
+        "topic": "Neuro – First seizure",
+        "level": "MS5/Intern",
+        "title": "Collapsed at home with witnessed tonic-clonic activity",
+        "stem": "28-year-old had a 2-minute tonic-clonic seizure, now post-ictal, afebrile, glucose 5.6, no head trauma.",
+        "history_options": [
+            {"key":"hx", "label":"Ask precipitating factors/tox/exposure", "value":"No alcohol binge, no new meds, poor sleep"},
+            {"key":"neuro", "label":"Ask focal neuro symptoms/headache", "value":"No headache, no focal deficits reported"},
+            {"key":"pmhx", "label":"Past neuro history", "value":"None; no family epilepsy"}
+        ],
+        "exam": "Neuro exam after recovery: non-focal. Vitals normal.",
+        "nbs": {
+            "prompt":"What is the next best step?",
+            "options":[
+                {"id":"A","text":"Start long-term anti-seizure medication immediately"},
+                {"id":"B","text":"Non-contrast CT brain now to exclude bleed/structural cause","correct":True},
+                {"id":"C","text":"Discharge with reassurance and outpatient EEG only"},
+                {"id":"D","text":"CT pulmonary angiogram"}
+            ]
+        },
+        "rationale_html": "<p><b>Non-contrast CT now.</b> First seizure warrants evaluation for structural causes or hemorrhage. Long-term medication often deferred until full work-up. Pure reassurance is unsafe without imaging depending on context.</p>",
+        "pitfalls": [
+            "Starting long-term medication before excluding secondary causes.",
+            "Skipping imaging on a first seizure without red-flag assessment.",
+            "Ordering unrelated tests (e.g., CTPA)."
+        ],
+        "takeaways": [
+            "First seizure: assess for red flags and structural causes.",
+            "CT brain (non-contrast) is appropriate in many ED settings.",
+            "Plan further outpatient EEG/MRI as indicated."
+        ],
+        "anz_ref": "ANZ Neurology guidance; ED first seizure pathways."
+    }
+]
+
+# Simple rotation for a "boss case" (reuse IDs or mark one as harder)
+BOSS_CASE_ID = 2  # make the sepsis case the 'boss' by default
 
 # ======================= Per-user state =======================
 USERS = {}
-
 def _blank_state():
     return {
         "xp": 0,
         "streak": 0,
-        "topic": None,
-        "day": 1,
-        "review_queue": {t: [] for t in QUESTIONS.keys()},
-        "recent_qs": {t: [] for t in QUESTIONS.keys()},
-        "nudge_plan": {t: {"anchors": 0} for t in QUESTIONS.keys()},
-        "completed_topics": [],
-        "topic_completed_at": {t: None for t in QUESTIONS.keys()},
-        "today_sets": {t: [] for t in QUESTIONS.keys()},
-        "last_cycle_completed_at": None,
-        "cycle_lock_until": 0.0
+        "last_completed_at": 0.0,
+        "cycle_lock_until": 0.0,
+        "today_case_id": None,
+        "today_started_at": None,
+        "history_selected": [],
+        "mode": "text",  # or "voice"
+        "scores": [],  # history_points, decision_correct, total_score
+        "recent_case_ids": [],
     }
 
 def _state():
@@ -221,290 +245,416 @@ def _state():
     return USERS[sid]
 
 def now_ts(): return time.time()
-def is_cycle_locked(S): return now_ts() < S.get("cycle_lock_until", 0.0)
+def is_locked(S): return now_ts() < S.get("cycle_lock_until", 0.0)
 def human_time_left(S):
     remaining = max(0, int(S.get("cycle_lock_until", 0.0) - now_ts()))
     h = remaining // 3600
     m = (remaining % 3600) // 60
     return h, m
 
-def reset_cycle_if_expired(S):
-    if not is_cycle_locked(S) and len(S["completed_topics"]) == len(CYCLE_TOPICS):
-        S["completed_topics"] = []
-        S["today_sets"] = {t: [] for t in QUESTIONS.keys()}
-        S["topic_completed_at"] = {t: None for t in QUESTIONS.keys()}
+def _pick_today_case():
+    # Friday boss case (optional)
+    weekday = datetime.utcnow().weekday()  # 0=Mon ... 4=Fri
+    if FRIDAY_BOSS and weekday == 4:
+        return next(c for c in CASES if c["id"] == BOSS_CASE_ID)
+    # otherwise pick one not used recently
+    recent = set(_state().get("recent_case_ids", [])[-5:])
+    pool = [c for c in CASES if c["id"] not in recent]
+    if not pool:
+        pool = CASES[:]
+    return random.choice(pool)
 
 # ======================= HOME =======================
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET","POST"])
 def home():
     S = _state()
-    reset_cycle_if_expired(S)
+    locked = is_locked(S)
+    h_left, m_left = human_time_left(S)
 
     if request.method == "POST":
-        topic = request.form.get("topic")
-        if is_cycle_locked(S):
+        if locked:
             return redirect(url_for("home"))
-        if topic in S["completed_topics"]:
-            return redirect(url_for("view_topic", topic=topic))
-
-        S["topic"] = topic
-
-        # ---- Build today's personalized set (review -> anchors -> fresh) ----
-        review_items = S["review_queue"].get(topic, [])[:]
-        review_q_texts = {q["q"] for q in review_items}
-
-        # ✅ NEW: exclude recently used questions (3-day rule)
-        recent = set(S["recent_qs"].get(topic, []))
-        pool = [q for q in QUESTIONS[topic] if q["q"] not in review_q_texts and q["q"] not in recent]
-
-        easy_pool = [q for q in pool if q.get("difficulty") == "easy" and q["q"] not in recent]
-        other_pool = [q for q in pool if q.get("difficulty") != "easy" and q["q"] not in recent]
-        random.shuffle(easy_pool); random.shuffle(other_pool)
-
-        anchors_needed = S["nudge_plan"][topic].get("anchors", 0)
-        anchors = []
-        for q in easy_pool[:anchors_needed]:
-            anchors.append(dict(q, _from_review=False, _from_anchor=True))
-
-        combined = [dict(r, _from_review=True, _from_anchor=False) for r in review_items]
-        combined.extend(anchors)
-
-        baseline = 5
-        fresh_needed = max(0, baseline - len(combined))
-        for f in other_pool[:fresh_needed]:
-            combined.append(dict(f, _from_review=False, _from_anchor=False))
-
-        if len(combined) < baseline:
-            more_easy = easy_pool[anchors_needed: anchors_needed + (baseline - len(combined))]
-            for e in more_easy:
-                combined.append(dict(e, _from_review=False, _from_anchor=False))
-
-        MAX_TOTAL = 10
-        if len(combined) < MAX_TOTAL:
-            remainder = other_pool[fresh_needed:] + easy_pool[anchors_needed + max(0, baseline - len(combined)):]
-            for x in remainder[:(MAX_TOTAL - len(combined))]:
-                combined.append(dict(x, _from_review=False, _from_anchor=False))
-
-        if len(combined) < baseline:
-            fallback = [q for q in QUESTIONS[topic] if q["q"] not in review_q_texts and q["q"] not in recent]
-            random.shuffle(fallback)
-            for y in fallback:
-                if len(combined) >= baseline: break
-                combined.append(dict(y, _from_review=False, _from_anchor=False))
-
-        # ✅ NEW: final deduplication step (within-session)
-        unique = []
-        seen_qs = set()
-        for q in combined:
-            if q["q"] not in seen_qs:
-                unique.append(q)
-                seen_qs.add(q["q"])
-        combined = unique
-
-        # Continue unchanged below ⬇️
-        session["question_list"] = combined
+        # Choose mode
+        S["mode"] = request.form.get("mode","text")
+        case = _pick_today_case()
+        S["today_case_id"] = case["id"]
+        S["today_started_at"] = now_ts()
+        S["history_selected"] = []
         session["score"] = 0
-        session["wrong_count"] = 0
-        session["start_time"] = time.time()
-
-        # Freeze view-only copy & consume today's review queue
-        S["today_sets"][topic] = [dict(q) for q in combined]
-        S["review_queue"][topic] = []
-
-        log_event("start_session", topic=topic)
-        return redirect(url_for("quiz", qid=0))
-
-    locked = is_cycle_locked(S)
-    h_left, m_left = human_time_left(S)
-    completed = {t: (t in S["completed_topics"]) for t in CYCLE_TOPICS}
+        session["unsafe"] = 0
+        log_event("start_case", topic=case["topic"], qid=case["id"])
+        return redirect(url_for("case_history"))
 
     return render_template_string("""
     <html>
     <head>
-        <title>MedBud</title>
-        <style>
-            body { font-family: Arial, system-ui; text-align:center; margin:0; padding:46px 20px;
-                   background: radial-gradient(1200px 600px at 20% 10%, #34d399 0%, #3b82f6 35%, #8b5cf6 70%, #0ea5e9 100%);
-                   color:white; }
-            h1 { font-size:44px; margin:6px 0 4px; text-shadow: 0 2px 12px rgba(0,0,0,0.25); }
-            .sub { opacity:0.95; margin-bottom:20px; }
-            .stats { display:flex; gap:12px; justify-content:center; margin:8px 0 18px; flex-wrap:wrap; }
-            .chip { background: rgba(255,255,255,0.16); padding:9px 14px; border-radius:999px; font-weight:700; backdrop-filter: blur(4px); }
-            .grid { max-width:620px; margin:0 auto; }
-            .row { display:flex; gap:12px; align-items:center; justify-content:center; flex-wrap:wrap; margin:10px 0; }
-            button, a.btn { padding:12px 18px; border:none; border-radius:14px; text-decoration:none; color:white; cursor:pointer; font-weight:700; }
-            .start { background: linear-gradient(135deg,#22c55e,#16a34a); box-shadow: 0 10px 24px rgba(22,163,74,0.35); }
-            .view { background: linear-gradient(135deg,#60a5fa,#2563eb); box-shadow: 0 10px 24px rgba(37,99,235,0.35); }
-            .disabled { background: rgba(255,255,255,0.18); color: rgba(255,255,255,0.7); cursor:not-allowed; }
-            .lock { margin:16px auto 6px; padding:10px 16px; background: rgba(0,0,0,0.25); border-radius:12px; display:inline-block; }
-            .topic { min-width:180px; text-align:left; font-weight:800; }
-            .done { opacity:0.9; }
-        </style>
+      <title>ENSO — Daily Clinical Rep</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body{font-family:Inter,Arial,system-ui;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(1200px 800px at 15% 10%,#34d399 0%,#3b82f6 35%,#8b5cf6 70%,#0ea5e9 100%);color:white}
+        .card{background:rgba(0,0,0,0.2);padding:28px;border-radius:18px;backdrop-filter:blur(6px);max-width:680px}
+        h1{margin:0 0 6px}
+        .sub{opacity:0.95;margin-bottom:16px}
+        .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+        button{padding:12px 16px;border:none;border-radius:12px;font-weight:700;color:white;cursor:pointer}
+        .start{background:linear-gradient(135deg,#22c55e,#16a34a)}
+        .disabled{opacity:0.6;cursor:not-allowed}
+        .chip{display:inline-block;background:rgba(255,255,255,0.16);padding:8px 12px;border-radius:999px;margin-right:8px}
+        small{opacity:0.9}
+      </style>
     </head>
     <body>
-        <h1>🧠 MedBud</h1>
-        <div class="sub">Complete <b>all three topics</b> once per day. After that, you’re done until the next window. (Day {{day}}/5)</div>
-        <div class="stats">
-            <div class="chip">🔥 Streak: {{streak}}</div>
-            <div class="chip">⭐ XP: {{xp}}</div>
-            <div class="chip">🧪 Variant: {{variant}}</div>
+      <div class="card">
+        <h1>🧠 ENSO — Daily Clinical Judgment Rep</h1>
+        <div class="sub">One 10–15 min case/day. Voice or text. Train <b>next best step</b> with instant rationale.</div>
+        <div style="margin:8px 0 16px">
+          <span class="chip">🔥 Streak: {{streak}}</span>
+          <span class="chip">⭐ XP: {{xp}}</span>
         </div>
-
         {% if locked %}
-          <div class="lock">🔒 Daily complete. Next unlock in <b>{{h_left}}h {{m_left}}m</b>.</div>
+          <div style="margin-bottom:12px;background:rgba(0,0,0,0.25);padding:10px;border-radius:10px">
+            🔒 Daily complete. Next unlock in <b>{{h_left}}h {{m_left}}m</b>.
+          </div>
         {% endif %}
-
-        <div class="grid">
-            {% for t in topics %}
-              <div class="row">
-                <div class="topic">{{ '🦴' if t=='Anatomy' else ('⚡' if t=='Physiology' else '🧬') }} <b>{{t}}</b></div>
-                <form method="post" style="display:inline">
-                    <input type="hidden" name="topic" value="{{t}}">
-                    {% if locked or completed[t] %}
-                      <button class="start disabled" disabled>Start</button>
-                    {% else %}
-                      <button class="start">Start</button>
-                    {% endif %}
-                </form>
-                {% if completed[t] %}
-                  <a class="btn view" href="{{ url_for('view_topic', topic=t) }}">View today’s set</a>
-                  <span class="done">✓ completed</span>
-                {% endif %}
-              </div>
-            {% endfor %}
-        </div>
+        <form method="post">
+          <div class="row">
+            <label><input type="radio" name="mode" value="voice" checked> Voice (with text fallback)</label>
+            <label><input type="radio" name="mode" value="text"> Text only</label>
+          </div>
+          <div class="row">
+            <button class="start {% if locked %}disabled{% endif %}" {% if locked %}disabled{% endif %}>Start Today’s Case</button>
+          </div>
+        </form>
+        <div style="margin-top:10px"><small>Tip: If voice is buggy on your device, switch to Text anytime.</small></div>
+      </div>
     </body>
     </html>
-    """, streak=S["streak"], xp=S["xp"], day=S["day"], variant=session.get("variant"),
-       locked=locked, h_left=h_left, m_left=m_left, topics=CYCLE_TOPICS, completed=completed)
+    """, streak=S["streak"], xp=S["xp"], h_left=h_left, m_left=m_left, locked=locked)
 
-# ======================= DONE =======================
+# ======================= CASE: HISTORY / EXAM =======================
+def _get_case():
+    cid = _state().get("today_case_id")
+    if not cid:
+        return None
+    for c in CASES:
+        if c["id"] == cid:
+            return c
+    return None
+
+@app.route("/history", methods=["GET","POST"])
+def case_history():
+    S = _state()
+    case = _get_case()
+    if not case: return redirect(url_for("home"))
+
+    if request.method == "POST":
+        selected = request.form.getlist("hx")
+        # Keep only 3 max to force prioritisation
+        selected = selected[:3]
+        S["history_selected"] = selected
+        # History points: each selected option worth 10 if it narrows risk
+        history_points = 0
+        for opt in case["history_options"]:
+            if opt["key"] in selected:
+                history_points += 10
+        session["history_points"] = min(history_points, 30)  # cap at 30
+        log_event("hx_done", topic=case["topic"], qid=case["id"], score=session["history_points"])
+        return redirect(url_for("case_exam"))
+
+    mode = S.get("mode","text")
+    return render_template_string("""
+    <html><head><title>History</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:Inter,Arial,system-ui;margin:0;padding:24px;background:#0f172a;color:#e2e8f0}
+      .wrap{max-width:760px;margin:0 auto}
+      .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px;margin:10px 0}
+      .btn{padding:12px 16px;border-radius:12px;border:none;color:white;background:linear-gradient(135deg,#2563eb,#1d4ed8);font-weight:700}
+      .hx{display:flex;gap:10px;flex-wrap:wrap}
+      label.hxopt{display:inline-flex;gap:8px;align-items:center;background:#0b1220;border:1px solid #243047;padding:10px 12px;border-radius:10px}
+      .pill{display:inline-block;background:#0b3b2f;color:#34d399;padding:4px 8px;border-radius:999px;margin-left:10px}
+      .mode{font-size:14px;opacity:0.85}
+    </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <div class="mode">Mode: <b>{{mode}}</b></div>
+          <h2>{{case['title']}}</h2>
+          <p><b>{{case['topic']}}</b> • {{case['level']}}</p>
+          <p>{{case['stem']}}</p>
+          <p><i>Pick up to 3 targeted history items (prioritise!).</i></p>
+          <form method="post">
+            <div class="hx">
+              {% for opt in case['history_options'] %}
+                <label class="hxopt">
+                  <input type="checkbox" name="hx" value="{{opt['key']}}" />
+                  {{opt['label']}} <span class="pill">reveals: {{opt['value']}}</span>
+                </label>
+              {% endfor %}
+            </div>
+            <div style="margin-top:12px">
+              <button class="btn">Continue to Exam</button>
+              <a class="btn" href="{{url_for('home')}}" style="background:#374151">Quit</a>
+            </div>
+          </form>
+        </div>
+      </div>
+      {% if mode=='voice' %}
+        <script>
+          // Progressive enhancement: read stem out loud if speechSynthesis exists
+          if ('speechSynthesis' in window) {
+            const msg = new SpeechSynthesisUtterance("{{case['title']}}. {{case['stem']}}. Pick up to three history questions.");
+            speechSynthesis.speak(msg);
+          }
+        </script>
+      {% endif %}
+    </body></html>
+    """, case=case, mode=mode)
+
+@app.route("/exam", methods=["GET","POST"])
+def case_exam():
+    S = _state()
+    case = _get_case()
+    if not case: return redirect(url_for("home"))
+    if request.method == "POST":
+        log_event("exam_viewed", topic=case["topic"], qid=case["id"])
+        return redirect(url_for("case_decision"))
+    return render_template_string("""
+    <html><head><title>Exam</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:Inter,Arial,system-ui;margin:0;padding:24px;background:#0f172a;color:#e2e8f0}
+      .wrap{max-width:760px;margin:0 auto}
+      .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px;margin:10px 0}
+      .btn{padding:12px 16px;border-radius:12px;border:none;color:white;background:linear-gradient(135deg,#22c55e,#16a34a);font-weight:700}
+    </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <h2>Exam & Vitals</h2>
+          <p>{{case['exam']}}</p>
+          <form method="post">
+            <button class="btn">Proceed to Next Best Step</button>
+          </form>
+        </div>
+      </div>
+    </body></html>
+    """, case=case)
+
+# ======================= DECISION (NBS) =======================
+@app.route("/decision", methods=["GET","POST"])
+def case_decision():
+    S = _state()
+    case = _get_case()
+    if not case: return redirect(url_for("home"))
+
+    if request.method == "POST":
+        choice = request.form.get("choice")
+        correct_id = next((o["id"] for o in case["nbs"]["options"] if o.get("correct")), None)
+        correct = (choice == correct_id)
+        unsafe = 1 if any(o["id"] == choice and o.get("safety_critical") for o in case["nbs"]["options"]) else 0
+
+        # Scoring rubric
+        history_points = int(session.get("history_points", 0))            # ≤30
+        decision_points = 40 if correct else 0                            # 40
+        data_points = 10                                                  # simple credit for reaching decision
+        reflection_points = 0                                             # added on /feedback
+        speed_bonus = 0
+        # speed bonus if under 10 minutes since start
+        started = _state().get("today_started_at") or now_ts()
+        elapsed = now_ts() - started
+        if elapsed <= 10*60: speed_bonus = 10
+
+        base_score = history_points + decision_points + data_points + speed_bonus
+        # unsafe penalty if wrong & safety-critical distractor chosen
+        if unsafe and not correct:
+            base_score = max(0, base_score - 30)
+
+        session["nbs_choice"] = choice
+        session["nbs_correct"] = int(correct)
+        session["unsafe"] = unsafe
+        session["pre_feedback_score"] = base_score
+
+        log_event("nbs_decision", topic=case["topic"], qid=case["id"], correct=int(correct), score=base_score)
+        return redirect(url_for("case_feedback"))
+
+    options = case["nbs"]["options"]
+    return render_template_string("""
+    <html><head><title>Next Best Step</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:Inter,Arial,system-ui;margin:0;padding:24px;background:#0f172a;color:#e2e8f0}
+      .wrap{max-width:760px;margin:0 auto}
+      .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px;margin:10px 0}
+      .opt{display:block;margin:8px 0;padding:10px 12px;border-radius:10px;border:1px solid #243047;background:#0b1220}
+      .btn{padding:12px 16px;border-radius:12px;border:none;color:white;background:linear-gradient(135deg,#2563eb,#1d4ed8);font-weight:700}
+    </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <h2>{{case['nbs']['prompt']}}</h2>
+          <form method="post">
+            {% for o in options %}
+              <label class="opt">
+                <input type="radio" name="choice" value="{{o['id']}}" required> {{o['id']}}) {{o['text']}}
+              </label>
+            {% endfor %}
+            <button class="btn" style="margin-top:10px">Submit Decision</button>
+          </form>
+        </div>
+      </div>
+    </body></html>
+    """, case=case, options=options)
+
+# ======================= FEEDBACK =======================
+@app.route("/feedback", methods=["GET","POST"])
+def case_feedback():
+    S = _state()
+    case = _get_case()
+    if not case: return redirect(url_for("home"))
+
+    if request.method == "POST":
+        reflection = request.form.get("reflection","").strip()
+        reflection_pts = 5 if len(reflection) >= 8 else 0
+        base = int(session.get("pre_feedback_score", 0))
+        total_score = base + reflection_pts
+
+        # Update XP and streak/cooldown
+        S["xp"] += total_score
+        # lock the daily run
+        S["cycle_lock_until"] = now_ts() + COOLDOWN_SECONDS
+        S["last_completed_at"] = now_ts()
+        # streak logic: if last was > cooldown ago, increment streak
+        last = S.get("last_completed_at", 0)
+        if (now_ts() - last) >= (COOLDOWN_SECONDS - 60):  # small forgiveness window
+            S["streak"] += 1
+        # store recent case id to avoid immediate repeats
+        rc = S.get("recent_case_ids", [])
+        rc.append(case["id"])
+        S["recent_case_ids"] = rc[-10:]
+
+        # log and finish
+        session["final_score"] = total_score
+        session["final_percent"] = min(100, int((total_score/100)*100))
+        log_event("feedback_done", topic=case["topic"], qid=case["id"], score=total_score, percent=session["final_percent"])
+        return redirect(url_for("done"))
+
+    correct_id = next((o["id"] for o in case["nbs"]["options"] if o.get("correct")), None)
+    choice = session.get("nbs_choice")
+    correct = bool(session.get("nbs_correct"))
+    unsafe = bool(session.get("unsafe"))
+    base = int(session.get("pre_feedback_score", 0))
+
+    # Build pitfalls list: show generic for wrong options
+    pitfalls = case.get("pitfalls", [])
+    takeaways = case.get("takeaways", [])
+    ref = case.get("anz_ref","")
+
+    return render_template_string("""
+    <html><head><title>Feedback</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:Inter,Arial,system-ui;margin:0;padding:24px;background:#f8fafc;color:#0f172a}
+      .wrap{max-width:820px;margin:0 auto}
+      .card{background:white;border:1px solid #e5e7eb;border-radius:14px;padding:18px;margin:10px 0}
+      .badge{display:inline-block;padding:6px 10px;border-radius:999px;background:#dbeafe;color:#1e40af;font-weight:700;margin-right:8px}
+      .ok{color:#065f46}
+      .err{color:#991b1b}
+      .pill{display:inline-block;background:#f1f5f9;color:#0f172a;padding:6px 10px;border-radius:999px;margin:4px 6px 0 0}
+      .btn{padding:12px 16px;border-radius:12px;border:none;color:white;background:linear-gradient(135deg,#22c55e,#16a34a);font-weight:700}
+      .subbtn{padding:10px 14px;border-radius:10px;border:none;background:#e2e8f0}
+      ul{margin-top:6px}
+    </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="card">
+          <span class="badge">{{ "✅ Correct" if correct else "❌ Not quite" }}</span>
+          {% if unsafe and not correct %}<span class="badge" style="background:#fee2e2;color:#991b1b">Safety risk</span>{% endif %}
+          <h2>{{case['title']}}</h2>
+          <p><b>{{case['topic']}}</b> • {{case['level']}}</p>
+          <div class="card" style="background:#f8fafc">
+            <h3 style="margin:0 0 6px">Instant Rationale</h3>
+            <div>{{case['rationale_html']|safe}}</div>
+            <p style="margin:6px 0 0;color:#334155"><i>{{case['anz_ref']}}</i></p>
+          </div>
+
+          <div class="card">
+            <h3 style="margin:0 0 6px">Why the other choices are wrong</h3>
+            <ul>
+              {% for p in pitfalls %}<li>{{p}}</li>{% endfor %}
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3 style="margin:0 0 6px">Takeaways (commit these)</h3>
+            <ul>
+              {% for t in takeaways %}<li>{{t}}</li>{% endfor %}
+            </ul>
+          </div>
+
+          <form method="post" class="card">
+            <h3 style="margin:0 0 6px">Micro-reflection (≤80 chars)</h3>
+            <input name="reflection" maxlength="80" placeholder="What will you do differently next time?" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px">
+            <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+              <button class="btn">Finish & Score</button>
+              <span>Base score: <b>{{base}}</b> / 100</span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </body></html>
+    """, case=case, correct=correct, unsafe=unsafe, base=base)
+
+# ======================= DONE / SUMMARY =======================
 @app.route("/done")
 def done():
     S = _state()
-    topic = S.get("topic") or "Anatomy"
-    questions = session.get("question_list", [])
-    total = len(questions) if questions else len(QUESTIONS[topic])
-    score = session.get("score", 0)
-    wrong = session.get("wrong_count", 0)
-    percent = int((score / max(total, 1)) * 100)
+    case = _get_case()
+    if not case: return redirect(url_for("home"))
 
-    # ✅ NEW: Track recents to avoid repeats across days
-    if questions:
-        recent_list = S["recent_qs"].setdefault(topic, [])
-        for q in questions:
-            if q["q"] not in recent_list:
-                recent_list.append(q["q"])
-        S["recent_qs"][topic] = recent_list[-30:]  # roughly 3 days of memory
+    total = 100
+    score = int(session.get("final_score", 0))
+    percent = int((score/total)*100)
+    S["today_case_id"] = None
 
-    # Rest unchanged below ⬇️
+    # Friendly finisher message
     if percent == 100:
-        message = "🌟 Perfect! You owned this session."
-        finisher_choices = [
-            "That was clinical-grade recall — bank the feeling.",
-            "Your neural pathways are firing like fiber optics — lock in that streak tomorrow.",
-            "Treat yourself and come back for a streak booster 🔥"
-        ]
+        message = "🌟 Perfect! Clinical-grade decision making."
     elif percent >= 80:
-        message = "🔥 Strong work! You’re getting sharper every day."
-        finisher_choices = [
-            "One more day like this and you’ll unlock a personal best.",
-            "Stack this win: same time tomorrow for habit momentum.",
-            "Close to mastery — tiny reps, compounding gains."
-        ]
+        message = "🔥 Strong work! Safer and faster each day."
     elif percent >= 50:
-        message = "💡 Solid effort — consistency will compound."
-        finisher_choices = [
-            "Today’s reps = tomorrow’s recall. Keep the streak warm.",
-            "Micro-wins add up — 5 minutes again tomorrow.",
-            "You’re laying tracks — the train gets faster with each day."
-        ]
+        message = "💡 Nice reps — keep compounding the habit."
     else:
-        message = "🌱 Good reps. Tomorrow you’ll be even sharper."
-        finisher_choices = [
-            "Every expert started here — we’ll tilt questions to your topic tomorrow.",
-            "Momentum beats perfection — 1% better next session.",
-            "You showed up — that’s the hardest part. We’ll tune the difficulty."
-        ]
-    finisher = random.choice(finisher_choices)
+        message = "🌱 You showed up — tomorrow will be sharper."
 
-    S["xp"] += score
-    if topic not in S["completed_topics"]:
-        S["completed_topics"].append(topic)
-        S["topic_completed_at"][topic] = now_ts()
-
-    anchors = 2 if (wrong >= 2 or percent < 60) else 0
-    S["nudge_plan"][topic] = {"anchors": anchors}
-
-    all_done = len(S["completed_topics"]) == len(CYCLE_TOPICS)
-    streak_incremented = False
-
-    if all_done:
-        now = now_ts()
-        last_done = S.get("last_cycle_completed_at")
-        if (last_done is None) or (now - last_done >= COOLDOWN_SECONDS):
-            S["streak"] += 1
-            S["day"] = min(S["day"] + 1, 5)
-            S["last_cycle_completed_at"] = now
-            S["cycle_lock_until"] = now + COOLDOWN_SECONDS
-            streak_incremented = True
-            log_event("cycle_completed", topic="ALL")
-        else:
-            S["cycle_lock_until"] = max(S.get("cycle_lock_until", 0.0), last_done + COOLDOWN_SECONDS)
-
-    log_event("done", topic=topic, score=score, total=total, percent=percent)
+    log_event("case_done", topic=case["topic"], qid=case["id"], score=score, total=total, percent=percent)
     h_left, m_left = human_time_left(S)
 
     return render_template_string("""
-    <html>
-    <head>
-        <title>Session Complete</title>
-        <style>
-            body { font-family: Arial, system-ui; text-align:center; margin:0; padding-top:80px;
-                   background: radial-gradient(900px 600px at 80% 0%, #bbf7d0 0%, #a7f3d0 40%, #86efac 70%, #d9f99d 100%); }
-            h1 { font-size:34px; color:#065f46; margin-bottom:8px; text-shadow: 0 1px 8px rgba(0,0,0,0.08); }
-            .stats { font-size:20px; margin: 8px 0 12px; color:#064e3b; }
-            .msg { font-size:22px; margin: 14px; color:#1e3a8a; font-weight:700; }
-            .finisher { font-size:18px; margin: 6px 0 20px; color:#0f172a; opacity:0.9; }
-            .chips { display:flex; gap:12px; justify-content:center; margin: 10px 0 26px; flex-wrap:wrap; }
-            .chip { background: rgba(16,185,129,0.14); color:#065f46; padding:8px 14px; border-radius:999px; font-weight:700; }
-            a { display:inline-block; padding:12px 28px; background: linear-gradient(135deg,#2563EB,#1d4ed8);
-                color:white; border-radius:12px; text-decoration:none; font-size:18px; box-shadow: 0 10px 22px rgba(37,99,235,0.25); }
-            a:hover { transform: translateY(-1px); }
-            .lock { margin-top:10px; }
-        </style>
+    <html><head><title>Complete</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:Inter,Arial,system-ui;margin:0;padding:60px 24px;background:radial-gradient(900px 600px at 80% 0%, #bbf7d0 0%, #a7f3d0 40%, #86efac 70%, #d9f99d 100%)}
+      .wrap{max-width:760px;margin:0 auto;background:white;border-radius:16px;padding:18px;border:1px solid #e5e7eb}
+      .chips{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+      .chip{background:#ecfeff;color:#0e7490;padding:8px 12px;border-radius:999px;font-weight:700}
+      a.btn{display:inline-block;padding:12px 16px;border-radius:12px;color:white;text-decoration:none;background:linear-gradient(135deg,#2563eb,#1d4ed8)}
+    </style>
     </head>
     <body>
-        <h1>🎉 Challenge Complete!</h1>
-        <div class="stats">Topic: <b>{{ topic }}</b> • Day {{ day }}/5</div>
-        <div class="stats">You scored <b>{{ score }}/{{ total }}</b> ({{ percent }}%).</div>
-        <div class="msg">{{ message }}</div>
-        <div class="finisher">👉 {{ finisher }}</div>
+      <div class="wrap">
+        <h2>🎉 Case Complete: {{case['title']}}</h2>
+        <p>{{message}}</p>
         <div class="chips">
-            <div class="chip">🔥 Streak: {{ streak }}</div>
-            <div class="chip">⭐ XP: {{ xp }}</div>
-            <div class="chip">✅ Done today: {{ done_count }}/3 topics</div>
-            {% if all_done %}
-              {% if streak_incremented %}
-                <div class="chip">📅 Streak +1</div>
-              {% else %}
-                <div class="chip">⏳ Streak waits for cooldown</div>
-              {% endif %}
-            {% endif %}
+          <div class="chip">Score: {{score}} / 100 ({{percent}}%)</div>
+          <div class="chip">🔥 Streak: {{streak}}</div>
+          <div class="chip">⭐ XP: {{xp}}</div>
         </div>
-
-        {% if all_done %}
-          <div class="lock">🔒 Daily complete. Next unlock in <b>{{ h_left }}h {{ m_left }}m</b>.</div>
-        {% endif %}
-
-        <a href="/">Back to Home</a>
-    </body>
-    </html>
-    """, topic=topic, score=score, total=total, percent=percent,
-       streak=S["streak"], xp=S["xp"], message=message, finisher=finisher,
-       day=S["day"], done_count=len(S["completed_topics"]),
-       all_done=all_done, streak_incremented=streak_incremented,
-       h_left=h_left, m_left=m_left)
+        <p>Daily run is locked. Next unlock in <b>{{h_left}}h {{m_left}}m</b>.</p>
+        <a href="/" class="btn">Back Home</a>
+      </div>
+    </body></html>
+    """, case=case, score=score, percent=percent, message=message,
+       streak=S["streak"], xp=S["xp"], h_left=h_left, m_left=m_left)
 
 # ======================= Analytics export =======================
 @app.route("/export.csv")
@@ -521,6 +671,8 @@ def export_csv():
     resp.headers["Content-Disposition"] = "attachment; filename=events.csv"
     return resp
 
+# ======================= Voice helper (optional, client-side only) =======================
+# Note: We use the browser Web Speech API in templates; no server endpoint needed.
+
 if __name__ == "__main__":
-    # Local dev; on Render, gunicorn runs it
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
