@@ -1,6 +1,6 @@
 # app.py — Enzo: Single-Case, Text-Only Clinical Judgment Trainer
 # - Single high-fidelity case with variable flow (priority/management/investigations/NBS/free text)
-# - Enzo 🐶 coach with graded hints (cost XP), fun UI (Tailwind CDN)
+# - Enzo 🐶 coach with graded hints (cost XP), playful modern UI (Tailwind CDN)
 # - Confidence calibration on each decision (rewards well-calibrated judgment)
 # - Badges: No Hints, Fast Finish, Well-Calibrated
 # - Streak increments once per calendar day on first completion (NO cooldown lock)
@@ -51,10 +51,9 @@ def log_event(event, topic=None, qid=None, correct=None, score=None, total=None,
     except Exception as e:
         print("analytics error:", e)
 
-# ======================= Session bootstrap =======================
+# ======================= Session bootstrap + gate =======================
 @app.before_request
-def ensure_session():
-    # Optional invite gate
+def ensure_session_and_gate():
     access_code = os.getenv("ACCESS_CODE")
     if access_code and request.endpoint not in ("gate","static"):
         if not request.cookies.get("access_ok"):
@@ -69,6 +68,7 @@ def today_str():
     return date.today().isoformat()
 
 def maybe_increment_streak():
+    # Increment streak once per calendar day on first completion
     t = today_str()
     if session.get("last_streak_day") != t:
         session["streak"] = session.get("streak", 0) + 1
@@ -160,17 +160,20 @@ CASE = {
 #     print("cases.json not loaded (using built-in case):", e)
 
 # ======================= Utility: scoring + calibration =======================
-def calibration_points(correct: bool, confidence_pct: int) -> int:
+def calibration_points(correct, confidence_pct):
     """
     Reward accurate confidence, penalize miscalibration.
     0..10 points each decision:
       - if correct: points ~ confidence (higher conf → more points)
       - if wrong: points ~ 100 - confidence (lower conf when wrong → more points)
     """
-    c = max(0, min(100, int(confidence_pct)))
+    try:
+        c = max(0, min(100, int(confidence_pct)))
+    except:
+        c = 50
     return c // 10 if correct else (100 - c) // 10
 
-def keyword_points(text: str, keywords: list[str]) -> int:
+def keyword_points(text, keywords):
     """
     Free-text scoring by keywords/groups. +4 per group hit, cap at 24.
     Each item can be 'kw1|kw2' to allow synonyms.
@@ -183,7 +186,7 @@ def keyword_points(text: str, keywords: list[str]) -> int:
             score += 4
     return min(24, score)
 
-# ======================= UI templates =======================
+# ======================= UI templates (plain strings; no f-strings) =======================
 BASE_HEAD = """
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -195,13 +198,13 @@ ENZO_BADGE = """
 </span>
 """
 
-HOME_HTML = f"""
-<!doctype html><html><head>{BASE_HEAD}<title>Enzo — Judgment Gym</title></head>
+HOME_HTML = """
+<!doctype html><html><head>""" + BASE_HEAD + """<title>Enzo — Judgment Gym</title></head>
 <body class="min-h-screen bg-gradient-to-br from-sky-500 via-indigo-500 to-emerald-500 text-white flex items-center justify-center p-4">
   <div class="w-full max-w-3xl bg-white/15 backdrop-blur-md rounded-2xl p-6 shadow-xl">
     <div class="flex items-center justify-between">
       <h1 class="text-3xl font-extrabold">Enzo — Clinical Judgment Gym</h1>
-      {ENZO_BADGE}
+      {{ enzo_badge|safe }}
     </div>
     <p class="opacity-90 mt-1">Short, realistic reps that train <b>what you do next</b>. Text-only. Calibrate confidence. Get coached.</p>
 
@@ -225,7 +228,7 @@ HOME_HTML = f"""
       </div>
     </div>
 
-    <form method="post" action="{{{{ url_for('start_case') }}}}" class="mt-4">
+    <form method="post" action="{{ url_for('start_case') }}" class="mt-4">
       <button class="px-5 py-3 rounded-xl font-bold bg-emerald-500 hover:bg-emerald-600">Start Case</button>
     </form>
 
@@ -234,23 +237,23 @@ HOME_HTML = f"""
 </body></html>
 """
 
-CASE_SHELL = f"""
-<!doctype html><html><head>{BASE_HEAD}<title>{{{{title}}}}</title></head>
+CASE_SHELL = """
+<!doctype html><html><head>""" + BASE_HEAD + """<title>{{ title }}</title></head>
 <body class="min-h-screen bg-slate-900 text-slate-100 p-4">
   <div class="max-w-3xl mx-auto">
     <div class="flex items-center justify-between mb-3">
-      <h1 class="text-2xl font-extrabold">{{{{title}}}}</h1>
-      {ENZO_BADGE}
+      <h1 class="text-2xl font-extrabold">{{ title }}</h1>
+      {{ enzo_badge|safe }}
     </div>
     <div class="bg-slate-800/70 rounded-xl p-4 mb-3">
-      <div class="text-sm">Stage {{{{stage_num}}}} / {{{{stage_total}}}}</div>
-      <div class="mt-1 text-slate-200 font-semibold">{{{{stage_label}}}}</div>
+      <div class="text-sm">Stage {{ stage_num }} / {{ stage_total }}</div>
+      <div class="mt-1 text-slate-200 font-semibold">{{ stage_label }}</div>
     </div>
 
     <form method="post" class="space-y-4">
-      {{{{body|safe}}}}
+      {{ body|safe }}
       <div class="flex gap-2">
-        <a href="{{{{ url_for('home') }}}}" class="px-4 py-2 rounded-lg bg-slate-700">Quit</a>
+        <a href="{{ url_for('home') }}" class="px-4 py-2 rounded-lg bg-slate-700">Quit</a>
         <button name="action" value="continue" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">Continue</button>
       </div>
     </form>
@@ -258,31 +261,31 @@ CASE_SHELL = f"""
 </body></html>
 """
 
-FEEDBACK_HTML = f"""
-<!doctype html><html><head>{BASE_HEAD}<title>Feedback</title></head>
+FEEDBACK_HTML = """
+<!doctype html><html><head>""" + BASE_HEAD + """<title>Feedback</title></head>
 <body class="min-h-screen bg-gradient-to-br from-emerald-50 to-sky-50 text-slate-900 p-4">
   <div class="max-w-3xl mx-auto bg-white rounded-2xl shadow p-5">
     <div class="flex items-center justify-between">
       <h2 class="text-2xl font-extrabold">Case Feedback</h2>
-      {ENZO_BADGE}
+      {{ enzo_badge|safe }}
     </div>
     <div class="flex flex-wrap gap-2 my-3">
-      <span class="px-3 py-1 rounded-full bg-emerald-100 text-emerald-900">Score: {{score}} / 100</span>
-      <span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900">🔥 Streak: {{streak}}</span>
-      <span class="px-3 py-1 rounded-full bg-amber-100 text-amber-900">⭐ XP: {{xp}}</span>
+      <span class="px-3 py-1 rounded-full bg-emerald-100 text-emerald-900">Score: {{ score }} / 100</span>
+      <span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900">🔥 Streak: {{ streak }}</span>
+      <span class="px-3 py-1 rounded-full bg-amber-100 text-amber-900">⭐ XP: {{ xp }}</span>
     </div>
 
     <div class="grid gap-4">
       <div class="bg-slate-50 border rounded-xl p-4">
         <h3 class="font-bold mb-1">Instant Rationale</h3>
-        <div class="prose max-w-none">{{rationale|safe}}</div>
-        <p class="text-sm text-slate-600 mt-2 italic">{{anz_ref}}</p>
+        <div class="prose max-w-none">{{ rationale|safe }}</div>
+        <p class="text-sm text-slate-600 mt-2 italic">{{ anz_ref }}</p>
       </div>
 
       <div class="bg-slate-50 border rounded-xl p-4">
         <h3 class="font-bold mb-1">Takeaways</h3>
         <ul class="list-disc ml-6">
-          {% for t in takeaways %}<li>{{t}}</li>{% endfor %}
+          {% for t in takeaways %}<li>{{ t }}</li>{% endfor %}
         </ul>
       </div>
 
@@ -290,24 +293,24 @@ FEEDBACK_HTML = f"""
         <h3 class="font-bold mb-1">Your Calibration</h3>
         <p class="text-sm text-slate-700">We reward accurate confidence. High+correct or low+wrong wins; high+wrong loses.</p>
         <ul class="list-disc ml-6">
-          <li>Priority: {{calib['priority']}} / 10</li>
-          <li>Investigations: {{calib['investigations']}} / 10</li>
-          <li>NBS: {{calib['nbs']}} / 10</li>
-          <li><b>Avg:</b> {{calib_avg}} / 10</li>
+          <li>Priority: {{ calib.priority }} / 10</li>
+          <li>Investigations: {{ calib.investigations }} / 10</li>
+          <li>NBS: {{ calib.nbs }} / 10</li>
+          <li><b>Avg:</b> {{ calib_avg }} / 10</li>
         </ul>
       </div>
 
       <div class="bg-slate-50 border rounded-xl p-4">
         <h3 class="font-bold mb-1">Badges</h3>
         <div class="flex flex-wrap gap-2">
-          {% for b in badges %}<span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900 font-semibold">{{b}}</span>{% endfor %}
+          {% for b in badges %}<span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900 font-semibold">{{ b }}</span>{% endfor %}
           {% if not badges %}<span class="text-slate-600">No badges this time—try a run with no hints, finish in under 8 min, and keep great calibration.</span>{% endif %}
         </div>
       </div>
 
-      <form method="post" action="{{url_for('finish_feedback')}}">
+      <form method="post" action="{{ url_for('finish_feedback') }}">
         <button class="px-5 py-3 rounded-xl font-bold bg-indigo-600 text-white hover:bg-indigo-700">Finish</button>
-        <a href="{{url_for('home')}}" class="ml-2 px-4 py-3 rounded-xl bg-slate-200">Back Home</a>
+        <a href="{{ url_for('home') }}" class="ml-2 px-4 py-3 rounded-xl bg-slate-200">Back Home</a>
       </form>
     </div>
   </div>
@@ -317,7 +320,12 @@ FEEDBACK_HTML = f"""
 # ======================= Routes =======================
 @app.route("/", methods=["GET"])
 def home():
-    return render_template_string(HOME_HTML, streak=session.get("streak",0), xp=session.get("xp",0))
+    return render_template_string(
+        HOME_HTML,
+        enzo_badge=ENZO_BADGE,
+        streak=session.get("streak",0),
+        xp=session.get("xp",0)
+    )
 
 @app.route("/start", methods=["POST"])
 def start_case():
@@ -347,10 +355,27 @@ def _stage_names(key):
         "free_text":"Free-text Summary"
     }.get(key, key)
 
+def _hint_block(stage_key, used, hints):
+    out = "<div class='mt-3 p-3 bg-indigo-950/40 rounded-lg'>"
+    # already shown hints
+    for i in range(used):
+        out += f"<div class='text-indigo-200 mb-1'>💡 {hints[i]}</div>"
+    # button to reveal next hint (if any)
+    if used < len(hints):
+        cost = HINT_COSTS[min(used, len(HINT_COSTS)-1)]
+        out += f"""
+        <button name="action" value="hint_{stage_key}" class="mt-2 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">
+          Get Hint (–{cost} XP)
+        </button>
+        """
+    else:
+        out += "<div class='text-indigo-300 opacity-80'>No more hints.</div>"
+    out += "</div>"
+    return out
+
 def _render_stage(case_state):
     key = case_state["flow"][case_state["stage_idx"]]
     body = ""
-    # Build stage body
     if key == "presenting":
         body = f"""
         <div class="bg-slate-800/60 rounded-xl p-4">
@@ -365,7 +390,6 @@ def _render_stage(case_state):
             <label class="block bg-slate-800 p-3 rounded-lg mb-2">
               <input required type="radio" name="choice" value="{o['id']}" class="mr-2 accent-indigo-500"> {o['id']}) {o['text']}
             </label>"""
-        # Hints
         used = case_state["hints_used"]["priority"]
         hint_block = _hint_block("priority", used, data["hints"])
         conf = case_state["decisions"].get("priority",{}).get("conf",50)
@@ -380,11 +404,13 @@ def _render_stage(case_state):
         {hint_block}
         """
     elif key == "history":
-        chips = "".join([f"<label class='inline-flex items-center gap-2 bg-slate-800 rounded-full px-3 py-2 mr-2 mb-2'><input type='checkbox' name='hx' value='{h}' class='accent-emerald-400'><span>{h}</span></label>" for h in CASE.get("history_tips", [])])
+        chips = "".join([
+            f"<label class='inline-flex items-center gap-2 bg-slate-800 rounded-full px-3 py-2 mr-2 mb-2'><input type='checkbox' name='hx' value='{h}' class='accent-emerald-400'><span>{h}</span></label>"
+            for h in CASE.get("history_tips", [])
+        ])
         body = "<p class='mb-2'>Pick up to 3 targeted history questions (prioritise):</p>" + chips
     elif key == "exam":
         body = f"<p class='mb-2'>Focused exam & vitals:</p><div class='bg-slate-800 p-3 rounded-lg'>{CASE.get('exam','')}</div>"
-        # If priority chosen, show evolving state snippet
         pr = case_state["decisions"].get("priority")
         if pr:
             evo = CASE["priority"]["state_if_correct"] if pr["correct"] else CASE["priority"]["state_if_wrong"]
@@ -438,24 +464,6 @@ def _render_stage(case_state):
         """
     return key, body
 
-def _hint_block(stage_key, used, hints):
-    out = "<div class='mt-3 p-3 bg-indigo-950/40 rounded-lg'>"
-    # already shown hints
-    for i in range(used):
-        out += f"<div class='text-indigo-200 mb-1'>💡 {hints[i]}</div>"
-    # button to reveal next hint (if any)
-    if used < len(hints):
-        cost = HINT_COSTS[min(used, len(HINT_COSTS)-1)]
-        out += f"""
-        <button name="action" value="hint_{stage_key}" class="mt-2 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">
-          Get Hint (–{cost} XP)
-        </button>
-        """
-    else:
-        out += "<div class='text-indigo-300 opacity-80'>No more hints.</div>"
-    out += "</div>"
-    return out
-
 @app.route("/stage", methods=["GET","POST"])
 def stage():
     case_state = session.get("case")
@@ -472,7 +480,10 @@ def stage():
             stage_key = action.split("hint_")[-1]
             if stage_key in case_state["hints_used"]:
                 used = case_state["hints_used"][stage_key]
-                max_hints = len(CASE[stage_key]["hints"])
+                try:
+                    max_hints = len(CASE[stage_key]["hints"])
+                except KeyError:
+                    max_hints = 0
                 if used < max_hints:
                     # charge XP
                     cost = HINT_COSTS[min(used, len(HINT_COSTS)-1)]
@@ -488,20 +499,16 @@ def stage():
             data = CASE["priority"]
             correct_id = next((o["id"] for o in data["options"] if o.get("correct")), None)
             correct = (choice == correct_id)
-            # base scoring
             case_state["score"] += 20 if correct else 0
-            # calibration
             case_state["score"] += calibration_points(correct, conf)
-            # save decision
             case_state["decisions"]["priority"] = {"choice": choice, "correct": correct, "conf": conf}
             log_event("priority_decision", topic=",".join(CASE["systems"]), qid=CASE["id"], correct=int(correct), score=case_state["score"])
         elif key == "history":
             chosen = request.form.getlist("hx")
             chosen = chosen[:3]
             case_state["decisions"]["history"] = {"chosen": chosen}
-            case_state["score"] += min(12, 4*len(chosen))  # small reward for prioritisation
+            case_state["score"] += min(12, 4*len(chosen))
         elif key == "exam":
-            # small participation points
             case_state["score"] += 4
         elif key == "investigations":
             inv = CASE.get("investigations")
@@ -543,6 +550,7 @@ def stage():
     stage_key, body = _render_stage(session["case"])
     return render_template_string(
         CASE_SHELL,
+        enzo_badge=ENZO_BADGE,
         title=f"{CASE['title']} • {CASE['level']} • {', '.join(CASE['systems'])}",
         stage_num=session["case"]["stage_idx"]+1,
         stage_total=len(session["case"]["flow"]),
@@ -574,7 +582,6 @@ def feedback():
     if (time.time() - case_state["start_ts"]) <= 8*60: badges.append("⚡ Fast Finish (<8 min)")
     if calib_avg >= 8: badges.append("🎯 Well-Calibrated")
 
-    # Save into session for finish step
     session["last_run"] = {
         "score": score,
         "calib": calib,
@@ -587,25 +594,24 @@ def feedback():
 
     return render_template_string(
         FEEDBACK_HTML,
+        enzo_badge=ENZO_BADGE,
         score=score,
         streak=session.get("streak",0),
         xp=session.get("xp",0),
         rationale=fb["rationale_html"],
         takeaways=fb["takeaways"],
         anz_ref=fb["anz_ref"],
-        calib=calib,
+        calib=type("Obj",(object,),calib)(),  # allow dot-access in Jinja
         calib_avg=calib_avg,
         badges=badges
     )
 
 @app.route("/finish", methods=["POST"])
 def finish_feedback():
-    # award XP = score minus hint penalties already applied via XP deductions, plus small streak bonus
     last = session.get("last_run", {"score":0})
     session["xp"] = session.get("xp",0) + int(last.get("score",0))
     maybe_increment_streak()
     log_event("case_done", topic=",".join(CASE["systems"]), qid=CASE["id"], score=last.get("score",0), total=100, percent=last.get("score",0))
-    # reset case so user can replay freely
     session.pop("case", None)
     return redirect(url_for("home"))
 
@@ -622,20 +628,20 @@ def gate():
             resp.set_cookie("access_ok","1", max_age=60*60*24*60)
             return resp
         err = "Incorrect code."
-    return render_template_string(f"""
-    <html><head>{BASE_HEAD}<title>Access</title></head>
+    return render_template_string("""
+    <html><head>""" + BASE_HEAD + """<title>Access</title></head>
     <body class="min-h-screen flex items-center justify-center bg-gradient-to-br from-sky-500 to-indigo-600 text-white">
       <form method="post" class="bg-white/15 backdrop-blur-md p-6 rounded-2xl">
         <div class="flex items-center justify-between mb-2">
           <h2 class="text-xl font-extrabold">Enter Invite Code</h2>
-          {ENZO_BADGE}
+          {{ enzo_badge|safe }}
         </div>
         <input name="code" class="text-black p-2 rounded-lg mr-2" placeholder="Access code">
         <button class="px-4 py-2 rounded-lg bg-emerald-500 font-bold">Enter</button>
-        {{% if err %}}<div class="text-rose-200 mt-2">{{{{err}}}}</div>{{% endif %}}
+        {% if err %}<div class="text-rose-200 mt-2">{{ err }}</div>{% endif %}
       </form>
     </body></html>
-    """, err=err)
+    """, err=err, enzo_badge=ENZO_BADGE)
 
 # ======================= Export analytics ======================
 @app.route("/export.csv")
