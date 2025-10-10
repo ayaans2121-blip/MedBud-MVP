@@ -1,20 +1,14 @@
-# app.py — Enzo: Clinical Judgment Trainer (text-only)
-# v2: Explicit XP rules, accurate rubric-based scoring, live vitals, realistic flow, no avatar.
-#
-# Highlights:
-# - Variable flow per case (priority → history → exam → investigations → NBS → free text)
-# - Confidence calibration scoring on each decision
-# - Explicit XP policy (see XP_POLICY) with transparent deductions for hints
-# - Rule-based rubric with safety-critical gates (prevents “99/100 when wrong”)
-# - Live vitals panel that changes as your decisions affect the patient
-# - Streak increments once per calendar day on FIRST completion; multiple cases allowed/day
-# - Simple badges for motivation
-# - Optional invite gate via ACCESS_CODE
-#
-# To add more cases later, duplicate CASE and/or wire in a cases.json loader (schema-compatible).
+# app.py — Enzo: Clinical Judgment Trainer (Text-only)
+# v3:
+# - Removed free-text stage (until proper AI scoring exists)
+# - History prioritization via ranking (1,2,3)
+# - Stricter, transparent scoring & caps (safety gate, wrong-answer caps, dangerous malus)
+# - Vitals fluctuate after each key stage based on decisions
+# - Confidence calibration and hints remain
+# - Streak increments once per calendar day on the FIRST completion; multiple cases allowed per day
 
 from flask import Flask, render_template_string, request, redirect, url_for, session, make_response
-import os, time, uuid, sqlite3, json
+import os, time, uuid, sqlite3
 from datetime import datetime, date
 
 app = Flask(__name__)
@@ -49,7 +43,7 @@ def log_event(event, topic=None, qid=None, correct=None, score=None, total=None,
         conn.execute(
             "INSERT INTO events (ts, session_id, event, topic, qid, correct, from_review, from_anchor, variant, score, total, percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (datetime.utcnow().isoformat(), session.get("sid"), event, topic, qid,
-             int(correct) if correct is not None else None, None, None, "EnzoMVPv2",
+             int(correct) if correct is not None else None, None, None, "EnzoMVPv3",
              score, total, percent)
         )
         conn.commit(); conn.close()
@@ -70,73 +64,69 @@ def ensure_session_and_gate():
         session.update(dict(xp=0, streak=0, last_streak_day=None, cases_completed_today=0))
 
 def today_str():
-    # If you want strict AU timezone handling, swap to pytz/zoneinfo; for MVP we use server date.
+    # MVP uses server day; for AU-specific day switch to zoneinfo later.
     return date.today().isoformat()
 
 def maybe_increment_streak_once_today():
-    # Increment streak ONCE per calendar day on FIRST completion only.
     t = today_str()
     if session.get("last_streak_day") != t:
         session["streak"] = session.get("streak", 0) + 1
         session["last_streak_day"] = t
         session["cases_completed_today"] = 1
     else:
-        # already incremented today; allow multiple cases without changing streak again
         session["cases_completed_today"] = session.get("cases_completed_today", 0) + 1
 
-# ======================= XP policy (explicit & transparent) =======================
+# ======================= XP policy / scoring rules =======================
 XP_POLICY = {
-    # Base points when correct per stage
-    "priority_correct": 30,          # safety-critical
-    "investigations_correct": 18,
-    "nbs_correct": 28,
-    "history_selection": 12,         # full if 3 targeted prompts chosen (4 each, capped)
+    # Base points for correct MCQs
+    "priority_correct": 35,        # safety-critical
+    "investigations_correct": 20,
+    "nbs_correct": 30,
+
+    # History ranking max (1=6 pts, 2=4 pts, 3=2 pts => 12 total)
+    "history_rank_points": {1: 6, 2: 4, 3: 2},
+    "history_max": 12,
+    "history_dup_malus": 4,        # per duplicate/missing rank
+
     "exam_participation": 6,
-    "free_text_keywords_cap": 24,    # 6 groups * 4 each
-    # Calibration on each decision (0..10 points)
+
+    # Confidence calibration (per decision, 0..10)
     "calibration_max_per_decision": 10,
-    # Hint costs (escalating)
-    "hint_costs": [2, 3, 5],         # Nudge, Clue, Teaching
-    # Speed bonus for overall run
-    "speed_bonus_fast": 8,           # <= 8 minutes
-    "speed_bonus_ok": 5,             # <= 12 minutes
-    # Safety-critical penalty / gating (if wrong, cap max achievable)
-    "safety_wrong_cap": 70,          # if priority safety step missed, total is capped
-    # Dangerous-choice malus
-    "dangerous_choice_malus": 10     # subtract if a clearly harmful option is chosen
+
+    # Hints (cost escalates: nudge, clue, teaching)
+    "hint_costs": [2, 3, 5],
+
+    # Speed bonus (total run)
+    "speed_bonus_fast": 5,         # <= 8 min
+    "speed_bonus_ok": 3,           # <= 12 min
+
+    # Safety/danger rules
+    "safety_wrong_cap": 70,        # miss safety-critical → cap total at 70
+    "one_wrong_cap": 95,           # any wrong MCQ → cap at 95
+    "two_wrong_cap": 88,           # two wrong MCQs → cap at 88
+    "dangerous_choice_malus": 15   # clearly harmful option
 }
 
 def calibration_points(correct, confidence_pct):
-    """Reward accurate confidence, penalize miscalibration. Yields 0..10 points."""
+    """Reward accurate confidence, penalize miscalibration. Returns 0..10."""
     try:
         c = max(0, min(100, int(confidence_pct)))
     except:
         c = 50
     return c // 10 if correct else (100 - c) // 10
 
-def keyword_points(text, keyword_groups, per_group=4, cap=24):
-    """Free-text scoring by keyword groups (allow synonyms with |)."""
-    if not text: return 0
-    t = text.lower()
-    score = 0
-    for group in keyword_groups:
-        if any(k.strip() in t for k in group.split("|")):
-            score += per_group
-    return min(cap, score)
-
-# ======================= One high-fidelity case (ACS-style) =======================
-# More realism: vitals change after key decisions; investigations & NBS aligned to common AU pathways.
-
+# ======================= Case definition with vitals evolution =======================
 CASE = {
-    "id": 2001,
+    "id": 3001,
     "systems": ["ED", "Cardio"],
     "title": "Chest pain in triage",
     "level": "Intern",
-    "flow": ["presenting", "priority", "history", "exam", "investigations", "nbs", "free_text"],
+    "flow": ["presenting", "priority", "history_rank", "exam", "investigations", "nbs"],
 
     "presenting": "A 45-year-old presents with 30 minutes of central, pressure-like chest pain, nausea, and diaphoresis.",
     "vitals_initial": {"HR": 98, "BP": "138/84", "RR": 18, "SpO2": "98% RA", "Temp": "36.8°C"},
 
+    # Priority (safety-critical)
     "priority": {
         "prompt": "Immediate priority?",
         "options": [
@@ -151,20 +141,26 @@ CASE = {
             "Teaching: Suspected ACS → obtain/read an ECG within 10 minutes."
         ],
         "state_if_correct": {
-            "note": "ECG obtained promptly; shows 1 mm ST depression in V4–V6.",
-            "vitals_delta": {}  # no deterioration
+            "note": "ECG obtained promptly; 1 mm ST depression in V4–V6.",
+            "vitals_delta": {"HR": -2}   # slight de-stress
         },
         "state_if_wrong": {
             "note": "Delay to ECG. Patient more distressed.",
-            "vitals_delta": {"HR": +12}  # HR rises, rest unchanged for simplicity
+            "vitals_delta": {"HR": +12}
         },
-        "dangerous_choices": ["D"]  # dangerously wrong for chest pain
+        "dangerous_choices": ["D"]
     },
 
-    "history_tips": [
+    # History ranking (rank 3 items 1→3). Desired priority order (best #1 first).
+    "history_items": [
         "Ask radiation/exertion/relief",
         "Ask risk factors/family history",
         "Ask diaphoresis/SOB/red flags"
+    ],
+    "history_desired_order": [
+        "Ask diaphoresis/SOB/red flags",      # #1 highest yield for immediate risk
+        "Ask radiation/exertion/relief",      # #2
+        "Ask risk factors/family history"     # #3
     ],
 
     "exam": "General: anxious but alert. Chest clear, S1/S2 normal. No focal neurology.",
@@ -181,7 +177,9 @@ CASE = {
             "Nudge: Which biomarker rises with myocardial injury but may be normal very early?",
             "Clue: Use it serially within pathway-based risk stratification."
         ],
-        "dangerous_choices": []
+        "dangerous_choices": [],
+        "state_if_correct": {"note":"You order serial troponins per pathway.","vitals_delta":{"HR": -4, "RR": -1}},
+        "state_if_wrong":   {"note":"Work-up is less targeted; progression continues.","vitals_delta":{"HR": +6, "RR": +1}}
     },
 
     "nbs": {
@@ -196,14 +194,10 @@ CASE = {
             "Nudge: Treat the dangerous possibility first while refining risk.",
             "Clue: Antiplatelet + pathway-based risk tools are paired."
         ],
-        "dangerous_choices": ["C"]  # unsafe discharge
+        "dangerous_choices": ["C"],
+        "state_if_correct": {"note":"Given antiplatelet; monitored on telemetry.","vitals_delta":{"HR": -6, "RR": -1}},
+        "state_if_wrong":   {"note":"Management delayed; risk increases.","vitals_delta":{"HR": +8, "RR": +2}}
     },
-
-    "free_text_prompt": "Free text (2–4 lines): likely diagnosis and immediate plan (include monitoring/escalation).",
-    "free_text_keywords": [
-        "ecg|twelve-lead", "aspirin|antiplatelet", "troponin",
-        "acs|nstemi|stemi", "risk|pathway|stratification", "monitor|telemetry|reassess"
-    ],
 
     "feedback": {
         "rationale_html": "<p><b>ECG first (≤10 min)</b> for suspected ACS; complement with serial troponins and pathway-based risk stratification. Start antiplatelet when indicated. Do not delay ECG for labs/imaging.</p>",
@@ -216,14 +210,7 @@ CASE = {
     }
 }
 
-# --- Optional loader (future): uncomment to load case from cases.json (same schema) ---
-# try:
-#     with open(os.path.join(os.path.dirname(__file__), "cases.json"), "r", encoding="utf-8") as f:
-#         CASE = json.load(f)
-# except Exception as e:
-#     print("cases.json not loaded (using built-in case):", e)
-
-# ======================= Templates (plain strings; avoid f-strings with Jinja) =======================
+# ======================= Templates =======================
 BASE_HEAD = """
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -234,7 +221,7 @@ HOME_HTML = """
 <body class="min-h-screen bg-gradient-to-br from-sky-500 via-indigo-500 to-emerald-500 text-white flex items-center justify-center p-4">
   <div class="w-full max-w-3xl bg-white/15 backdrop-blur-md rounded-2xl p-6 shadow-xl">
     <h1 class="text-3xl font-extrabold">Enzo — Clinical Judgment Trainer</h1>
-    <p class="opacity-90 mt-1">Short, realistic reps that train <b>what you do next</b>. Text-only. Confidence-calibrated. Coached with hints.</p>
+    <p class="opacity-90 mt-1">Short, realistic reps that train <b>what you do next</b>. Confidence-calibrated. Coached with hints.</p>
 
     <div class="flex flex-wrap gap-2 my-4">
       <span class="px-3 py-1 rounded-full bg-white/20">🔥 Streak: {{ streak }}</span>
@@ -245,16 +232,16 @@ HOME_HTML = """
     <div class="grid gap-3 sm:grid-cols-2">
       <div class="bg-white/10 rounded-xl p-4">
         <h3 class="font-bold">Today’s Case</h3>
-        <p class="opacity-90">ACS-style chest pain (Intern level). Live vitals, variable flow, hints, calibration, rubric-based scoring.</p>
+        <p class="opacity-90">ACS-style chest pain (Intern level). Live vitals, ranking-based history, hints, calibration, strict scoring.</p>
       </div>
       <div class="bg-white/10 rounded-xl p-4">
-        <h3 class="font-bold">How scoring works</h3>
+        <h3 class="font-bold">Scoring at a glance</h3>
         <ul class="list-disc ml-5 opacity-90">
-          <li>Base points per decision (priority/investigations/NBS)</li>
-          <li>Confidence calibration (0–10 each decision)</li>
-          <li>Free-text keywords (max 24) + history/exam points</li>
-          <li>Hint costs (2/3/5), speed bonus (+8/+5)</li>
-          <li>Safety-critical gating & dangerous-choice penalties</li>
+          <li>Base points per correct decision</li>
+          <li>Confidence calibration (0–10 per MCQ)</li>
+          <li>History ranking (1→3: 6/4/2 points; penalties for duplicates)</li>
+          <li>Speed bonus (+5 ≤8m; +3 ≤12m)</li>
+          <li>Safety gate (cap 70), wrong caps (95/88), dangerous malus (–15)</li>
         </ul>
       </div>
     </div>
@@ -332,7 +319,6 @@ FEEDBACK_HTML = """
 
       <div class="bg-slate-50 border rounded-xl p-4">
         <h3 class="font-bold mb-1">Calibration</h3>
-        <p class="text-sm text-slate-700">We reward accurate confidence. High+correct or low+wrong wins; high+wrong loses.</p>
         <ul class="list-disc ml-6">
           <li>Priority: {{ calib.priority }} / 10</li>
           <li>Investigations: {{ calib.investigations }} / 10</li>
@@ -345,7 +331,7 @@ FEEDBACK_HTML = """
         <h3 class="font-bold mb-1">Badges</h3>
         <div class="flex flex-wrap gap-2">
           {% for b in badges %}<span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900 font-semibold">{{ b }}</span>{% endfor %}
-          {% if not badges %}<span class="text-slate-600">No badges this time—try a run with no hints, finish <8 min, and stay well-calibrated.</span>{% endif %}
+          {% if not badges %}<span class="text-slate-600">No badges this time—try no hints, and finish <8 min, with strong calibration.</span>{% endif %}
         </div>
       </div>
 
@@ -365,7 +351,42 @@ FEEDBACK_HTML = """
 </body></html>
 """
 
-# ======================= Routes + Case Engine =======================
+# ======================= Engine helpers =======================
+def _stage_name(key):
+    return {
+        "presenting":"Presenting Problem",
+        "priority":"Immediate Priority",
+        "history_rank":"Targeted History (Prioritise 1→3)",
+        "exam":"Focused Exam/Vitals",
+        "investigations":"Investigations",
+        "nbs":"Next Best Step"
+    }.get(key, key)
+
+def _apply_vitals_delta(vitals: dict, delta: dict):
+    out = dict(vitals)
+    for k,v in (delta or {}).items():
+        if isinstance(v, (int, float)) and isinstance(out.get(k), (int, float)):
+            out[k] = out.get(k, 0) + v
+    return out
+
+def _hint_block(stage_key, used, hints):
+    costs = XP_POLICY["hint_costs"]
+    out = "<div class='mt-3 p-3 bg-indigo-950/40 rounded-lg'>"
+    for i in range(used):
+        out += f"<div class='text-indigo-200 mb-1'>💡 {hints[i]}</div>"
+    if used < len(hints):
+        cost = costs[min(used, len(costs)-1)]
+        out += f"""
+        <button name="action" value="hint_{stage_key}" class="mt-2 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">
+          Get Hint (–{cost} XP)
+        </button>
+        """
+    else:
+        out += "<div class='text-indigo-300 opacity-80'>No more hints.</div>"
+    out += "</div>"
+    return out
+
+# ======================= Routes =======================
 @app.route("/", methods=["GET"])
 def home():
     return render_template_string(
@@ -377,68 +398,27 @@ def home():
 
 @app.route("/start", methods=["POST"])
 def start_case():
-    # initialise case state
     session["case"] = {
         "id": CASE["id"],
         "flow": CASE["flow"][:],
         "stage_idx": 0,
         "score": 0,
-        "xp_earned": 0,  # running XP for this case
+        "xp_earned": 0,
         "start_ts": time.time(),
         "hints_used": {"priority":0, "investigations":0, "nbs":0},
-        "decisions": {},      # e.g., {"priority": {"choice":"B","correct":True,"conf":80}}
-        "free_text": "",
-        "badges": [],
-        "vitals": dict(CASE["vitals_initial"]),  # live vitals
-        "xp_lines": []        # breakdown strings
+        "decisions": {},
+        "vitals": dict(CASE["vitals_initial"]),
+        "xp_lines": [],
+        "wrong_mcq_count": 0   # tracks wrong answers for cap logic
     }
     log_event("start_case", topic=",".join(CASE["systems"]), qid=CASE["id"])
     return redirect(url_for("stage"))
-
-def _stage_name(key):
-    return {
-        "presenting":"Presenting Problem",
-        "priority":"Immediate Priority",
-        "history":"Targeted History",
-        "exam":"Focused Exam/Vitals",
-        "investigations":"Investigations",
-        "nbs":"Next Best Step",
-        "free_text":"Free-text Summary"
-    }.get(key, key)
-
-def _apply_vitals_delta(vitals: dict, delta: dict):
-    # Apply numeric deltas only; strings like BP remain unchanged for MVP simplicity
-    out = dict(vitals)
-    for k,v in (delta or {}).items():
-        if isinstance(v, (int, float)) and isinstance(out.get(k), (int, float)):
-            out[k] = out.get(k, 0) + v
-    return out
-
-def _hint_block(stage_key, used, hints):
-    out = "<div class='mt-3 p-3 bg-indigo-950/40 rounded-lg'>"
-    for i in range(used):
-        out += f"<div class='text-indigo-200 mb-1'>💡 {hints[i]}</div>"
-    if used < len(hints):
-        cost = XP_POLICY["hint_costs"][min(used, len(XP_POLICY["hint_costs"])-1)]
-        out += f"""
-        <button name="action" value="hint_{stage_key}" class="mt-2 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">
-          Get Hint (–{cost} XP)
-        </button>
-        """
-    else:
-        out += "<div class='text-indigo-300 opacity-80'>No more hints.</div>"
-    out += "</div>"
-    return out
 
 def _render_stage(case_state):
     key = case_state["flow"][case_state["stage_idx"]]
     body = ""
     if key == "presenting":
-        body = """
-        <div class="bg-slate-800/60 rounded-xl p-4">
-          <p class="text-lg">""" + CASE['presenting'] + """</p>
-        </div>
-        """
+        body = "<div class='bg-slate-800/60 rounded-xl p-4'><p class='text-lg'>" + CASE['presenting'] + "</p></div>"
     elif key == "priority":
         data = CASE["priority"]
         opts = ""
@@ -450,28 +430,38 @@ def _render_stage(case_state):
         used = case_state["hints_used"]["priority"]
         hint_block = _hint_block("priority", used, data["hints"])
         prev_conf = case_state["decisions"].get("priority",{}).get("conf",50)
-        body = """
-        <p class="mb-2">""" + data["prompt"] + """</p>
-        """ + opts + """
+        body = "<p class='mb-2'>" + data["prompt"] + "</p>" + opts + """
         <div class="mt-3 p-3 bg-slate-800 rounded-lg">
           <label class="block font-semibold mb-1">Confidence (0–100%)</label>
           <input type="range" min="0" max="100" value='""" + str(prev_conf) + """' name="confidence" class="w-full">
-          <div class="text-sm mt-1 opacity-80">Be honest—calibration matters.</div>
+        </div>""" + hint_block
+    elif key == "history_rank":
+        items = CASE["history_items"]
+        # three unique dropdowns for rank 1/2/3
+        def dd(name):
+            s = f"<select required name='{name}' class='text-black rounded-lg p-2 mr-2'>"
+            s += "<option value=''>-- select --</option>"
+            for it in items:
+                s += f"<option value='{it}'>{it}</option>"
+            s += "</select>"
+            return s
+        body = """
+        <p class='mb-2'>Prioritise your first 3 history questions (1 = most urgent/impactful):</p>
+        <div class='bg-slate-800 p-3 rounded-lg'>
+          <div class='mb-2'><b>Rank 1:</b> """ + dd("rank1") + """</div>
+          <div class='mb-2'><b>Rank 2:</b> """ + dd("rank2") + """</div>
+          <div class='mb-2'><b>Rank 3:</b> """ + dd("rank3") + """</div>
+          <div class='text-sm opacity-80 mt-2'>Tip: prioritise red-flag screening first, then core characterisation, then risk context.</div>
         </div>
-        """ + hint_block
-    elif key == "history":
-        chips = ""
-        for h in CASE.get("history_tips", []):
-            chips += "<label class='inline-flex items-center gap-2 bg-slate-800 rounded-full px-3 py-2 mr-2 mb-2'><input type='checkbox' name='hx' value='" + h + "' class='accent-emerald-400'><span>" + h + "</span></label>"
-        body = "<p class='mb-2'>Pick up to 3 targeted history questions (prioritise):</p>" + chips
+        """
     elif key == "exam":
-        body = "<p class='mb-2'>Focused exam & vitals:</p><div class='bg-slate-800 p-3 rounded-lg'>" + CASE.get('exam','') + "</div>"
+        body = "<p class='mb-2'>Focused exam & context:</p><div class='bg-slate-800 p-3 rounded-lg'>" + CASE.get('exam','') + "</div>"
         pr = case_state["decisions"].get("priority")
         if pr:
-            evo = CASE["priority"]["state_if_correct"]["note"] if pr["correct"] else CASE["priority"]["state_if_wrong"]["note"]
+            evo = pr.get("note","")
             body += "<div class='mt-3 bg-indigo-900/40 p-3 rounded-lg'><b>Update:</b> " + evo + "</div>"
     elif key == "investigations":
-        inv = CASE.get("investigations")
+        inv = CASE["investigations"]
         opts = ""
         for o in inv["options"]:
             opts += """
@@ -485,10 +475,9 @@ def _render_stage(case_state):
         <div class="mt-3 p-3 bg-slate-800 rounded-lg">
           <label class="block font-semibold mb-1">Confidence (0–100%)</label>
           <input type="range" min="0" max="100" value='""" + str(prev_conf) + """' name="confidence" class="w-full">
-        </div>
-        """ + hint_block
+        </div>""" + hint_block
     elif key == "nbs":
-        nbs = CASE.get("nbs")
+        nbs = CASE["nbs"]
         opts = ""
         for o in nbs["options"]:
             opts += """
@@ -502,13 +491,7 @@ def _render_stage(case_state):
         <div class="mt-3 p-3 bg-slate-800 rounded-lg">
           <label class="block font-semibold mb-1">Confidence (0–100%)</label>
           <input type="range" min="0" max="100" value='""" + str(prev_conf) + """' name="confidence" class="w-full">
-        </div>
-        """ + hint_block
-    elif key == "free_text":
-        prev = case_state.get("free_text","")
-        body = "<p class='mb-2'>" + CASE.get('free_text_prompt','Free text: summary & plan') + "</p>" + \
-               "<textarea name='free_text' rows='4' class='w-full rounded-lg p-3 text-black' placeholder='2–4 lines...'>" + prev + "</textarea>" + \
-               "<div class='text-sm opacity-80 mt-1'>Include: likely dx, immediate plan, monitoring/escalation.</div>"
+        </div>""" + hint_block
     return key, body
 
 @app.route("/stage", methods=["GET","POST"])
@@ -517,22 +500,17 @@ def stage():
     if not case_state: return redirect(url_for("home"))
     flow = case_state["flow"]
 
-    # Handle actions
     if request.method == "POST":
         action = request.form.get("action","continue")
         key = flow[case_state["stage_idx"]]
 
-        # Handle Hints (stay on stage)
+        # Hints
         if action.startswith("hint_"):
             stage_key = action.split("hint_")[-1]
             if stage_key in case_state["hints_used"]:
                 used = case_state["hints_used"][stage_key]
-                try:
-                    max_hints = len(CASE[stage_key]["hints"])
-                except KeyError:
-                    max_hints = 0
-                if used < max_hints:
-                    # XP deduction
+                hints = CASE.get(stage_key,{}).get("hints",[])
+                if used < len(hints):
                     cost = XP_POLICY["hint_costs"][min(used, len(XP_POLICY["hint_costs"])-1)]
                     session["xp"] = max(0, session.get("xp",0) - cost)
                     case_state["xp_earned"] -= cost
@@ -541,8 +519,7 @@ def stage():
             session["case"] = case_state
             return redirect(url_for("stage"))
 
-        # Otherwise process stage and advance
-        # PRIORITY
+        # Process stage results
         if key == "priority":
             choice = request.form.get("choice")
             conf = int(request.form.get("confidence", 50))
@@ -550,54 +527,57 @@ def stage():
             correct_id = next((o["id"] for o in data["options"] if o.get("correct")), None)
             correct = (choice == correct_id)
 
-            # base points + calibration
             if correct:
-                case_state["score"] += XP_POLICY["priority_correct"]
-                case_state["xp_earned"] += XP_POLICY["priority_correct"]
-                case_state["xp_lines"].append(f"+{XP_POLICY['priority_correct']} XP: Correct priority")
-                case_state["badges"].append("✅ Perfect Priority")
-                # vitals: apply "correct" delta (often none; early stabilisation prevents deterioration)
-                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], CASE["priority"]["state_if_correct"]["vitals_delta"])
+                pts = XP_POLICY["priority_correct"]
+                case_state["score"] += pts; case_state["xp_earned"] += pts
+                case_state["xp_lines"].append(f"+{pts} XP: Correct priority")
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], data["state_if_correct"]["vitals_delta"])
+                note = data["state_if_correct"]["note"]
             else:
-                # safety-critical gate: cap maximum achievable score
                 case_state["decisions"]["safety_cap"] = True
                 case_state["xp_lines"].append(f"⚠️ Safety-critical missed: score capped at {XP_POLICY['safety_wrong_cap']}")
-                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], CASE["priority"]["state_if_wrong"]["vitals_delta"])
-                # dangerous choice penalty
-                if choice in CASE["priority"].get("dangerous_choices", []):
-                    case_state["score"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_earned"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_lines"].append(f"-{XP_POLICY['dangerous_choice_malus']} XP: Dangerous choice")
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], data["state_if_wrong"]["vitals_delta"])
+                note = data["state_if_wrong"]["note"]
+                case_state["wrong_mcq_count"] += 1
+                if choice in data.get("dangerous_choices", []):
+                    mal = XP_POLICY["dangerous_choice_malus"]
+                    case_state["score"] -= mal; case_state["xp_earned"] -= mal
+                    case_state["xp_lines"].append(f"-{mal} XP: Dangerous choice")
 
             cal = calibration_points(correct, conf)
-            case_state["score"] += cal
-            case_state["xp_earned"] += cal
+            case_state["score"] += cal; case_state["xp_earned"] += cal
             case_state["xp_lines"].append(f"+{cal} XP: Calibration (priority)")
 
-            case_state["decisions"]["priority"] = {"choice": choice, "correct": correct, "conf": conf}
-
-            # Add a textual state note for exam stage
-            case_state["decisions"]["priority_note"] = CASE["priority"]["state_if_correct"]["note"] if correct else CASE["priority"]["state_if_wrong"]["note"]
-
+            case_state["decisions"]["priority"] = {"choice": choice, "correct": correct, "conf": conf, "note": note}
             log_event("priority_decision", topic=",".join(CASE["systems"]), qid=CASE["id"], correct=int(correct), score=case_state["score"])
 
-        # HISTORY
-        elif key == "history":
-            chosen = request.form.getlist("hx")[:3]
-            pts = min(XP_POLICY["history_selection"], 4*len(chosen))
-            case_state["score"] += pts
-            case_state["xp_earned"] += pts
-            case_state["xp_lines"].append(f"+{pts} XP: Targeted history selection")
-            case_state["decisions"]["history"] = {"chosen": chosen}
+        elif key == "history_rank":
+            r1 = request.form.get("rank1")
+            r2 = request.form.get("rank2")
+            r3 = request.form.get("rank3")
+            chosen = [r1, r2, r3]
+            desired = CASE["history_desired_order"]
+            # Points by position
+            pts = 0
+            if r1: pts += XP_POLICY["history_rank_points"].get(1,0) if r1 == desired[0] else 0
+            if r2: pts += XP_POLICY["history_rank_points"].get(2,0) if r2 == desired[1] else 0
+            if r3: pts += XP_POLICY["history_rank_points"].get(3,0) if r3 == desired[2] else 0
+            # Penalize duplicates/missing
+            seen = [c for c in chosen if c]
+            if len(set(seen)) != len(seen):
+                dup_pen = XP_POLICY["history_dup_malus"]
+                pts -= dup_pen
+                case_state["xp_lines"].append(f"-{dup_pen} XP: Duplicate/missing history ranking")
+            pts = max(0, min(XP_POLICY["history_max"], pts))
+            case_state["score"] += pts; case_state["xp_earned"] += pts
+            case_state["xp_lines"].append(f"+{pts} XP: History prioritisation")
+            case_state["decisions"]["history_rank"] = {"rank1": r1, "rank2": r2, "rank3": r3}
 
-        # EXAM
         elif key == "exam":
             pts = XP_POLICY["exam_participation"]
-            case_state["score"] += pts
-            case_state["xp_earned"] += pts
+            case_state["score"] += pts; case_state["xp_earned"] += pts
             case_state["xp_lines"].append(f"+{pts} XP: Exam participation")
 
-        # INVESTIGATIONS
         elif key == "investigations":
             inv = CASE["investigations"]
             choice = request.form.get("choice")
@@ -606,24 +586,26 @@ def stage():
             correct = (choice == corr)
 
             if correct:
-                case_state["score"] += XP_POLICY["investigations_correct"]
-                case_state["xp_earned"] += XP_POLICY["investigations_correct"]
-                case_state["xp_lines"].append(f"+{XP_POLICY['investigations_correct']} XP: Correct investigation")
+                pts = XP_POLICY["investigations_correct"]
+                case_state["score"] += pts; case_state["xp_earned"] += pts
+                case_state["xp_lines"].append(f"+{pts} XP: Correct investigation")
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], inv["state_if_correct"]["vitals_delta"])
+                note = inv["state_if_correct"]["note"]
             else:
+                case_state["wrong_mcq_count"] += 1
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], inv["state_if_wrong"]["vitals_delta"])
+                note = inv["state_if_wrong"]["note"]
                 if choice in inv.get("dangerous_choices", []):
-                    case_state["score"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_earned"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_lines"].append(f"-{XP_POLICY['dangerous_choice_malus']} XP: Dangerous investigation")
+                    mal = XP_POLICY["dangerous_choice_malus"]
+                    case_state["score"] -= mal; case_state["xp_earned"] -= mal
+                    case_state["xp_lines"].append(f"-{mal} XP: Dangerous investigation")
 
             cal = calibration_points(correct, conf)
-            case_state["score"] += cal
-            case_state["xp_earned"] += cal
+            case_state["score"] += cal; case_state["xp_earned"] += cal
             case_state["xp_lines"].append(f"+{cal} XP: Calibration (investigations)")
-
-            case_state["decisions"]["investigations"] = {"choice": choice, "correct": correct, "conf": conf}
+            case_state["decisions"]["investigations"] = {"choice": choice, "correct": correct, "conf": conf, "note": note}
             log_event("investigation_decision", topic=",".join(CASE["systems"]), qid=CASE["id"], correct=int(correct), score=case_state["score"])
 
-        # NBS
         elif key == "nbs":
             nbs = CASE["nbs"]
             choice = request.form.get("choice")
@@ -632,33 +614,27 @@ def stage():
             correct = (choice == corr)
 
             if correct:
-                case_state["score"] += XP_POLICY["nbs_correct"]
-                case_state["xp_earned"] += XP_POLICY["nbs_correct"]
-                case_state["xp_lines"].append(f"+{XP_POLICY['nbs_correct']} XP: Correct next step")
+                pts = XP_POLICY["nbs_correct"]
+                case_state["score"] += pts; case_state["xp_earned"] += pts
+                case_state["xp_lines"].append(f"+{pts} XP: Correct next step")
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], nbs["state_if_correct"]["vitals_delta"])
+                note = nbs["state_if_correct"]["note"]
             else:
+                case_state["wrong_mcq_count"] += 1
+                case_state["vitals"] = _apply_vitals_delta(case_state["vitals"], nbs["state_if_wrong"]["vitals_delta"])
+                note = nbs["state_if_wrong"]["note"]
                 if choice in nbs.get("dangerous_choices", []):
-                    case_state["score"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_earned"] -= XP_POLICY["dangerous_choice_malus"]
-                    case_state["xp_lines"].append(f"-{XP_POLICY['dangerous_choice_malus']} XP: Dangerous next step")
+                    mal = XP_POLICY["dangerous_choice_malus"]
+                    case_state["score"] -= mal; case_state["xp_earned"] -= mal
+                    case_state["xp_lines"].append(f"-{mal} XP: Dangerous next step")
 
             cal = calibration_points(correct, conf)
-            case_state["score"] += cal
-            case_state["xp_earned"] += cal
+            case_state["score"] += cal; case_state["xp_earned"] += cal
             case_state["xp_lines"].append(f"+{cal} XP: Calibration (NBS)")
-
-            case_state["decisions"]["nbs"] = {"choice": choice, "correct": correct, "conf": conf}
+            case_state["decisions"]["nbs"] = {"choice": choice, "correct": correct, "conf": conf, "note": note}
             log_event("nbs_decision", topic=",".join(CASE["systems"]), qid=CASE["id"], correct=int(correct), score=case_state["score"])
 
-        # FREE TEXT
-        elif key == "free_text":
-            ft = (request.form.get("free_text","") or "").strip()
-            case_state["free_text"] = ft
-            kw_pts = keyword_points(ft, CASE.get("free_text_keywords", []), per_group=4, cap=XP_POLICY["free_text_keywords_cap"])
-            case_state["score"] += kw_pts
-            case_state["xp_earned"] += kw_pts
-            case_state["xp_lines"].append(f"+{kw_pts} XP: Free-text clinical reasoning")
-
-        # Advance stage
+        # advance
         case_state["stage_idx"] += 1
         session["case"] = case_state
 
@@ -672,20 +648,28 @@ def stage():
             else:
                 sb = 0
             if sb:
-                case_state["score"] += sb
-                case_state["xp_earned"] += sb
+                case_state["score"] += sb; case_state["xp_earned"] += sb
                 case_state["xp_lines"].append(f"+{sb} XP: Speed bonus")
 
-            # Apply safety cap if missed safety-critical priority
+            # Apply caps
             if case_state["decisions"].get("safety_cap"):
-                if case_state["score"] > XP_POLICY["safety_wrong_cap"]:
-                    case_state["xp_lines"].append(f"Score capped at {XP_POLICY['safety_wrong_cap']} due to missed safety-critical step")
+                case_state["xp_lines"].append(f"Score capped at {XP_POLICY['safety_wrong_cap']} (safety-critical miss)")
                 case_state["score"] = min(case_state["score"], XP_POLICY["safety_wrong_cap"])
+            else:
+                wc = case_state["wrong_mcq_count"]
+                if wc >= 2:
+                    cap = XP_POLICY["two_wrong_cap"]
+                    case_state["xp_lines"].append(f"Score capped at {cap} (two wrong MCQs)")
+                    case_state["score"] = min(case_state["score"], cap)
+                elif wc == 1:
+                    cap = XP_POLICY["one_wrong_cap"]
+                    case_state["xp_lines"].append(f"Score capped at {cap} (one wrong MCQ)")
+                    case_state["score"] = min(case_state["score"], cap)
 
             session["case"] = case_state
             return redirect(url_for("feedback"))
 
-    # Render current stage
+    # Render
     key, body = _render_stage(session["case"])
     return render_template_string(
         CASE_SHELL,
@@ -704,19 +688,15 @@ def feedback():
     case_state = session.get("case")
     if not case_state: return redirect(url_for("home"))
 
-    # Final rounded score 0..100
     score = max(0, min(100, int(round(case_state["score"]))))
 
     # Calibration breakdown
-    calib = {
-        "priority": calibration_points(case_state["decisions"].get("priority",{}).get("correct",False),
-                                       case_state["decisions"].get("priority",{}).get("conf",50)) if "priority" in case_state["decisions"] else 0,
-        "investigations": calibration_points(case_state["decisions"].get("investigations",{}).get("correct",False),
-                                             case_state["decisions"].get("investigations",{}).get("conf",50)) if "investigations" in case_state["decisions"] else 0,
-        "nbs": calibration_points(case_state["decisions"].get("nbs",{}).get("correct",False),
-                                  case_state["decisions"].get("nbs",{}).get("conf",50)) if "nbs" in case_state["decisions"] else 0,
-    }
-    calib_avg = round(sum(calib.values())/max(1,len(calib)),1)
+    def c_of(key):
+        d = case_state["decisions"].get(key, {})
+        if not d: return 0
+        return calibration_points(d.get("correct",False), d.get("conf",50))
+    calib = {"priority": c_of("priority"), "investigations": c_of("investigations"), "nbs": c_of("nbs")}
+    calib_avg = round(sum(calib.values())/3.0, 1)
 
     # Badges
     total_hints = sum(case_state["hints_used"].values())
@@ -726,7 +706,6 @@ def feedback():
     if calib_avg >= 8: badges.append("🎯 Well-Calibrated")
     if case_state["decisions"].get("priority",{}).get("correct"): badges.append("✅ Perfect Priority")
 
-    # Save run details for finish step
     session["last_run"] = {
         "score": score,
         "calib": calib,
@@ -739,7 +718,6 @@ def feedback():
     fb = CASE["feedback"]
     log_event("case_feedback", topic=",".join(CASE["systems"]), qid=CASE["id"], score=score, total=100, percent=score)
 
-    # XP shown currently is account total; the breakdown list shows what contributed.
     return render_template_string(
         FEEDBACK_HTML,
         score=score,
@@ -748,7 +726,7 @@ def feedback():
         rationale=fb["rationale_html"],
         takeaways=fb["takeaways"],
         anz_ref=fb["anz_ref"],
-        calib=type("Obj",(object,),calib)(),  # dot-access in Jinja
+        calib=type("Obj",(object,),calib)(),
         calib_avg=calib_avg,
         badges=badges,
         xp_breakdown=session["last_run"]["xp_lines"]
@@ -756,12 +734,10 @@ def feedback():
 
 @app.route("/finish", methods=["POST"])
 def finish_feedback():
-    # Award XP earned this case to account total (hint costs already deducted during case)
     last = session.get("last_run", {"score":0, "xp_case":0})
     session["xp"] = max(0, session.get("xp",0) + int(last.get("xp_case",0)))
     maybe_increment_streak_once_today()
     log_event("case_done", topic=",".join(CASE["systems"]), qid=CASE["id"], score=last.get("score",0), total=100, percent=last.get("score",0))
-    # reset case so user can replay freely
     session.pop("case", None)
     return redirect(url_for("home"))
 
@@ -802,11 +778,12 @@ def export_csv():
     csv = "ts,session_id,event,topic,qid,correct,from_review,from_anchor,variant,score,total,percent\n"
     for r in rows:
         csv += ",".join("" if v is None else str(v) for v in r) + "\n"
-    resp = make_response(csv)
+    from flask import make_response as _mr
+    resp = _mr(csv)
     resp.headers["Content-Type"] = "text/csv"
     resp.headers["Content-Disposition"] = "attachment; filename=events.csv"
     return resp
 
-# ======================= Local dev run (Render uses Gunicorn) ======
+# ======================= Local run (Render uses Gunicorn) ======
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")), debug=True)
