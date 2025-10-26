@@ -1,10 +1,10 @@
-# app.py — MedBud (AUS) — v6.2
-# - JSON-safe session (no sets)
-# - SQLite WAL + /tmp option
+# app.py — MedBud (AUS) — v6.3
+# - FIX: JSON-safe session via deep sanitizer (converts any set -> list)
+# - SQLite WAL + optional DB_DIR=/tmp
 # - /healthz endpoint
 # - Judgment-first flow (no trivia MCQs)
-# - Block picker (Cardiology enabled, others disabled placeholders)
-# - CXR overlay stub (add static/cxr_sample.jpg to enable)
+# - Block picker (Cardiology enabled)
+# - CXR overlay stub (static/cxr_sample.jpg)
 # - AUS escalation cues consolidated in feedback
 # - Stricter scoring & safety caps
 
@@ -14,9 +14,34 @@ from flask import (
 )
 import os, time, uuid, sqlite3, traceback, sys
 from datetime import date, datetime
+from collections.abc import Mapping, Sequence
 
 app = Flask(__name__, static_folder="static")
 app.secret_key = os.getenv("SECRET_KEY", "supersecretkey")  # set in Render env for prod
+
+# ======================= JSON sanitizer (kills sets everywhere) =======================
+def _jsonifyable(x):
+    """Recursively convert Python-only types (e.g., set/tuple) into JSON-safe structures."""
+    # sets -> list
+    if isinstance(x, set):
+        return [_jsonifyable(v) for v in x]
+    # tuples -> list (JSON has arrays)
+    if isinstance(x, tuple):
+        return [_jsonifyable(v) for v in x]
+    # dict-like
+    if isinstance(x, Mapping):
+        return {str(k): _jsonifyable(v) for k, v in x.items()}
+    # list-like (but not str/bytes)
+    if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray)):
+        return [_jsonifyable(v) for v in x]
+    return x
+
+def _set_session(key, value):
+    session[key] = _jsonifyable(value)
+    session.modified = True
+
+def _update_session_case(state):
+    _set_session("case", state)
 
 # ======================= SQLite (safe for Render/Gunicorn) =======================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,7 +84,7 @@ def log_event(event, topic=None, qid=None, correct=None, score=None, total=None,
         conn.execute(
             "INSERT INTO events (ts,session_id,event,topic,qid,correct,from_review,from_anchor,variant,score,total,percent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.utcnow().isoformat(), session.get("sid"), event, topic, qid,
-             int(correct) if correct is not None else None, int(from_review or 0), None, "MedBud_v6.2",
+             int(correct) if correct is not None else None, int(from_review or 0), None, "MedBud_v6.3",
              score, total, percent)
         )
         conn.close()
@@ -129,9 +154,10 @@ def ensure_session_and_gate():
             return redirect(url_for("gate"))
 
     if "sid" not in session:
-        session["sid"] = str(uuid.uuid4())
+        _set_session("sid", str(uuid.uuid4()))
     if "xp" not in session:
         session.update(dict(xp=0, streak=0, last_streak_day=None, cases_completed_today=0))
+        session.modified = True
 
 @app.route("/healthz")
 def healthz():
@@ -153,6 +179,7 @@ def maybe_increment_streak_once_today():
         session["cases_completed_today"] = 1
     else:
         session["cases_completed_today"] = session.get("cases_completed_today", 0) + 1
+    session.modified = True
 
 # ======================= Scoring / XP policy =======================
 XP = {
@@ -202,7 +229,6 @@ CASE = {
         "Ongoing pain despite initial measures",
         "High-risk features (e.g., GRACE high-risk) or rising troponins"
     ],
-    # Judgment-first sections
     "immediate_actions": {
         "prompt": "Immediate actions (select all to do now):",
         "items": [
@@ -535,8 +561,11 @@ def _table_html(rows):
 
 def _cap(state, name: str):
     """Add a safety cap label uniquely (list, JSON-safe)."""
-    if name not in state["safety_caps"]:
-        state["safety_caps"].append(name)
+    caps = state.get("safety_caps", [])
+    if name not in caps:
+        caps = caps + [name]
+        state["safety_caps"] = caps  # keep immutable-ish pattern
+    return state
 
 # ======================= Routes =======================
 @app.route("/", methods=["GET"])
@@ -557,9 +586,9 @@ def start_case():
     review_prefill = request.form.get("review_prefill","").strip()
     review_targets = [t for t in review_prefill.split("|") if t] if review_prefill else due_spaced_tags(limit=4)
 
-    session["case"] = {
+    case_obj = {
         "id": CASE["id"],
-        "flow": CASE["flow"][:],
+        "flow": list(CASE["flow"]),      # ensure list
         "stage_idx": 0,
         "score": 0,
         "xp_earned": 0,
@@ -567,10 +596,11 @@ def start_case():
         "decisions": {},
         "vitals": dict(CASE["vitals_initial"]),
         "xp_lines": [],
-        "safety_caps": [],         # JSON-safe (list)
-        "contra_flags": [],        # list of (section_title, [ids])
-        "review_targets": review_targets or []
+        "safety_caps": [],               # list (JSON-safe)
+        "contra_flags": [],              # list of [section, ids...]
+        "review_targets": list(review_targets) if review_targets else []
     }
+    _update_session_case(_jsonifyable(case_obj))
     log_event("start_case", topic=",".join(CASE["systems"]), qid=CASE["id"], from_review=1 if review_targets else 0)
     return redirect(url_for("stage"))
 
@@ -630,7 +660,6 @@ def _render_stage(state):
     return key, body
 
 def _score_required_contra(ticks, items, full_points, section_title, state, review_tag_ok=None):
-    # ticks: list[str]; items: list[dict]
     ids_req = [i["id"] for i in items if i.get("required")]
     ids_contra_heavy = [i["id"] for i in items if i.get("contra") == "heavy"]
     ids_contra_moderate = [i["id"] for i in items if i.get("contra") == "moderate"]
@@ -652,11 +681,11 @@ def _score_required_contra(ticks, items, full_points, section_title, state, revi
     if unsafe_heavy:
         points = max(0, points - XP["contra_malus_heavy"])
         unsafes.extend(unsafe_heavy)
-        state["contra_flags"].append((section_title, unsafe_heavy))
+        state["contra_flags"].append([section_title, list(unsafe_heavy)])
     if unsafe_moderate:
         points = max(0, points - XP["contra_malus_moderate"])
         unsafes.extend(unsafe_moderate)
-        state["contra_flags"].append((section_title, unsafe_moderate))
+        state["contra_flags"].append([section_title, list(unsafe_moderate)])
 
     if missing:
         _cap(state, section_title)
@@ -720,7 +749,7 @@ def stage():
             pts = XP["ecg_read_full"] if not missing and not picked_contra else (XP["ecg_read_full"]//3 if not missing else 0)
             if picked_contra:
                 pts = max(0, pts - XP["contra_malus_moderate"])
-                state["contra_flags"].append(("ECG Checklist", picked_contra))
+                state["contra_flags"].append(["ECG Checklist", list(picked_contra)])
             if missing:
                 _cap(state, "ECG Checklist")
             upsert_spaced_tag(CASE["ecg_read"]["review_tag_correct"], not missing and not picked_contra)
@@ -748,7 +777,7 @@ def stage():
             pts = XP["labs_reasoning_full"] if not missing and not unsafe else (XP["labs_reasoning_full"]//3 if not missing else 0)
             if unsafe:
                 pts = max(0, pts - XP["contra_malus_moderate"])
-                state["contra_flags"].append(("Labs Reasoning", unsafe))
+                state["contra_flags"].append(["Labs Reasoning", list(unsafe)])
             if missing:
                 _cap(state, "Labs Reasoning")
             for o in opts:
@@ -768,7 +797,7 @@ def stage():
             pts = XP["imaging_panel_full"] if not missing and not unsafe else (XP["imaging_panel_full"]//3 if not missing else 0)
             if unsafe:
                 pts = max(0, pts - XP["contra_malus_moderate"])
-                state["contra_flags"].append(("Imaging Panel", unsafe))
+                state["contra_flags"].append(["Imaging Panel", list(unsafe)])
             if missing:
                 _cap(state, "Imaging Panel")
             upsert_spaced_tag(ip["review_tag_correct"], not missing and not unsafe)
@@ -798,7 +827,7 @@ def stage():
 
         # advance
         state["stage_idx"] += 1
-        session["case"] = state
+        _update_session_case(_jsonifyable(state))
 
         if state["stage_idx"] >= len(flow):
             # Speed bonus and cap enforcement
@@ -807,11 +836,11 @@ def stage():
             if sb:
                 state["score"] += sb; state["xp_earned"] += sb
                 state["xp_lines"].append(f"+{sb} Speed bonus")
-            if state["safety_caps"]:
+            if state.get("safety_caps"):
                 cap = XP["miss_required_stage_cap"]
                 state["xp_lines"].append(f"Score capped at {cap} (missed required in: {', '.join(state['safety_caps'])})")
                 state["score"] = min(state["score"], cap)
-            session["case"] = state
+            _update_session_case(_jsonifyable(state))
             return redirect(url_for("feedback"))
 
     key, body = _render_stage(state)
@@ -950,9 +979,9 @@ def feedback():
     )
 
     review_suggestions = []
-    if "ECG Checklist" in state["safety_caps"]: review_suggestions.append("ECG_ISCHAEMIA_RECOGNITION")
-    if "Immediate Actions" in state["safety_caps"]: review_suggestions.append("ACS_ECG_10MIN")
-    if "Plan Builder" in state["safety_caps"]: review_suggestions.append("ACS_PATHWAY")
+    if "ECG Checklist" in state.get("safety_caps", []): review_suggestions.append("ECG_ISCHAEMIA_RECOGNITION")
+    if "Immediate Actions" in state.get("safety_caps", []): review_suggestions.append("ACS_ECG_10MIN")
+    if "Plan Builder" in state.get("safety_caps", []): review_suggestions.append("ACS_PATHWAY")
 
     fb = CASE["feedback"]
     log_event("case_feedback", topic=",".join(CASE["systems"]), qid=CASE["id"], score=score, total=100, percent=score,
@@ -981,6 +1010,7 @@ def finish_feedback():
     maybe_increment_streak_once_today()
     log_event("case_done", topic=",".join(CASE["systems"]), qid=CASE["id"], score=score, total=100, percent=score)
     session.pop("case", None)
+    session.modified = True
     return redirect(url_for("home"))
 
 # ======================= Gate (optional) =======================
