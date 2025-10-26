@@ -1,13 +1,12 @@
-# app.py — Enzo (ENSO): Clinical Judgment Trainer — v5
-# Changes:
-# - Block picker on Home (Cardio enabled; others shown disabled for roadmap)
-# - Judgment-first case structure (rank history -> priority -> focused exam ->
-#   ECG read -> choose initial order-set (checkbox) -> labs review -> imaging panel with overlays ->
-#   investigations -> next-best-step -> escalation/hand-off)
-# - Deeper feedback with explicit AU cues + curriculum LO mapping (Cardio LOs)
-# - Personalized session header (name + rotation)
-# - Spaced resurfacing (same as v4)
-# - Imaging overlay scaffold (drop /static/cxr_sample.jpg; CSS overlays toggled in UI)
+# app.py — MedBud: Clinical Judgment Trainer (AUS) — v6
+# Changes vs v5:
+# - App renamed to MedBud; single Home (removed profile/name UI and any second "tab")
+# - AUS escalation cues appear ONLY in Feedback, not during the case
+# - Replaced single-answer MCQs with judgment-first, interactive flows (checkbox/select-limited):
+#     immediate_actions, targeted_history, focused_exam, ECG checklist, order_set, labs_reasoning,
+#     imaging overlays, plan_builder, handoff
+# - Stricter scoring & safety rules; attending-style, in-depth feedback by stage
+# - Cardiology block picker present (others hidden/disabled until added)
 
 from flask import Flask, render_template_string, request, redirect, url_for, session, make_response, send_from_directory
 import os, time, uuid, sqlite3
@@ -45,7 +44,7 @@ def log_event(event, topic=None, qid=None, correct=None, score=None, total=None,
         conn.execute(
             "INSERT INTO events (ts,session_id,event,topic,qid,correct,from_review,from_anchor,variant,score,total,percent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.utcnow().isoformat(), session.get("sid"), event, topic, qid,
-             int(correct) if correct is not None else None, int(from_review or 0), None, "EnzoMVPv5",
+             int(correct) if correct is not None else None, int(from_review or 0), None, "MedBud_v6",
              score, total, percent)
         )
         conn.commit(); conn.close()
@@ -109,10 +108,6 @@ def ensure_session_and_gate():
         session["sid"] = str(uuid.uuid4())
     if "xp" not in session:
         session.update(dict(xp=0, streak=0, last_streak_day=None, cases_completed_today=0))
-    # personalize defaults
-    session.setdefault("user_name", "")
-    session.setdefault("rotation", "Cardiology")
-    session.setdefault("block", "Cardiology")
 
 def today_str(): return date.today().isoformat()
 
@@ -125,95 +120,89 @@ def maybe_increment_streak_once_today():
     else:
         session["cases_completed_today"] = session.get("cases_completed_today", 0) + 1
 
-# ======================= Scoring / XP policy =======================
-XP_POLICY = {
-    "priority_correct": 35,
-    "investigations_correct": 20,
-    "nbs_correct": 30,
-    "history_rank_points": {1: 6, 2: 4, 3: 2},
-    "history_max": 12,
-    "history_dup_malus": 4,
-    "exam_participation": 6,
-    "ecg_interpretation_full": 12,  # structured checklist
-    "orders_points_required_each": 5,  # per required order in initial order-set
-    "orders_malus_contra": 8,         # penalty for contra/unsafe order
-    "labs_reasoning_full": 12,        # lab interpretation points
-    "calibration_max_per_decision": 10,
-    "hint_costs": [2,3,5],
-    "speed_bonus_fast": 5,
-    "speed_bonus_ok": 3,
-    "safety_wrong_cap": 70,
-    "one_wrong_cap": 95,
-    "two_wrong_cap": 88,
-    "dangerous_choice_malus": 15
+# ======================= Scoring / XP policy (stricter) =======================
+XP = {
+    # hard requirements & maluses
+    "miss_required_stage_cap": 60,     # if a stage has mandatory actions missed → cap final score
+    "contra_malus_heavy": 20,          # unsafe action
+    "contra_malus_moderate": 12,
+    # per-stage conservative points
+    "immediate_actions_full": 20,
+    "history_select_full": 12,
+    "focused_exam_full": 12,
+    "ecg_read_full": 12,
+    "order_set_full": 20,
+    "labs_reasoning_full": 12,
+    "imaging_panel_full": 8,
+    "plan_builder_full": 20,
+    "handoff_full": 8,
+    # speed bonus (unchanged)
+    "speed_bonus_fast": 5,             # <= 8 min
+    "speed_bonus_ok": 3,               # <= 12 min
 }
 
-def calibration_points(correct, confidence_pct):
-    try:
-        c = max(0, min(100, int(confidence_pct)))
-    except:
-        c = 50
-    return c // 10 if correct else (100 - c) // 10
-
-# ======================= Cardio Case (Judgment-first) =======================
-# NOTE: imaging overlay uses /static/cxr_sample.jpg; add your own file there.
-CASE_CARDIO = {
+# ======================= Cardio Case (judgment-first) =======================
+CASE = {
     "block": "Cardiology",
-    "id": 4001,
+    "id": 6001,
     "systems": ["ED", "Cardio"],
     "title": "Acute Chest Pain at Triage (AUS)",
     "level": "MD3–4 / Intern-ready",
     "flow": [
-        "presenting", "priority", "history_rank", "focused_exam",
-        "ecg_read", "initial_orders", "labs_review", "imaging_panel",
-        "investigations", "nbs", "handoff"
+        "presenting", "immediate_actions", "targeted_history",
+        "focused_exam", "ecg_read", "order_set",
+        "labs_reasoning", "imaging_panel", "plan_builder", "handoff"
     ],
-    "presenting": "A 54-year-old presents with 40 minutes of central, pressure-like chest pain radiating to the left arm with diaphoresis and nausea. Pain 8/10, non-pleuritic, not positional.",
+    "presenting": "A 54-year-old presents with 40 minutes of central, pressure-like chest pain radiating to the left arm with diaphoresis and nausea. Pain 8/10.",
     "vitals_initial": {"HR": 102, "BP": "146/88", "RR": 20, "SpO2": "96% RA", "Temp": "36.9°C"},
+    # Curriculum outcomes: replace with your exact LO IDs/text later
     "curriculum_outcomes": [
-        # From your CV block LOs (selection)
-        "Interpret a simple chest X-ray and CT (Cardio block LO).",
-        "Describe the normal ECG and identify major changes.",
-        "Discuss the pharmacology of anti-platelet agents, heparins, thrombolytics.",
-        "Discuss the pathology of coronary atherosclerosis and acute coronary syndromes.",
-        "Discuss differential diagnoses of acute chest pain.",
-        "Describe the coronary circulation and factors determining myocardial O2 demand/supply."
+        "Interpret a systematic ECG and identify ischaemia.",
+        "Discuss differential diagnoses of acute chest pain and initial management priorities.",
+        "Apply pathway-based ACS assessment including serial hs-troponins.",
+        "Describe pharmacology/safety of aspirin and nitrates in ACS.",
+        "Perform focused cardiovascular exam; recognise red flags.",
+        "Interpret a portable CXR with a systematic approach."
     ],
+    # AUS escalation cues (shown in feedback only)
     "escalation_cues": [
-        "New ST deviation or dynamic changes on ECG",
-        "Hemodynamic compromise (hypotension, syncope, arrhythmia)",
+        "New ST deviation or dynamic ECG changes",
+        "Hemodynamic compromise (hypotension, arrhythmia, syncope)",
         "Ongoing pain despite initial measures",
         "High-risk features (e.g., GRACE high-risk) or rising troponins"
     ],
-    "priority": {
-        "prompt": "Immediate priority?",
-        "options": [
-            {"id":"A","text":"Wait for initial troponin before ECG"},
-            {"id":"B","text":"12-lead ECG within 10 minutes of arrival","correct":True,"safety_critical":True,"review_tag":"ACS_ECG_10MIN"},
-            {"id":"C","text":"Discharge with next-day stress test"},
-            {"id":"D","text":"CT pulmonary angiogram first"}
-        ],
-        "hints": [
-            "Nudge (AUS): Which step is immediate and decision-changing for ACS?",
-            "Clue: ED chest pain pathways mandate an immediate ECG."
-        ],
-        "state_if_correct": {"note":"ECG performed promptly shows 1 mm ST depression V4–V6.", "vitals_delta":{"HR":-2}},
-        "state_if_wrong": {"note":"ECG delayed; patient more distressed.", "vitals_delta":{"HR":+10}},
-        "dangerous_choices": ["C"]
+    # Stage definitions
+    "immediate_actions": {
+        "prompt": "Immediate actions (select all to do now):",
+        "items": [
+            {"id":"ecg_10", "text":"12-lead ECG within 10 minutes", "required": True, "tag":"ACS_ECG_10MIN"},
+            {"id":"monitor", "text":"Cardiac monitoring + IV access", "required": True, "tag":"ACS_MONITOR_IV"},
+            {"id":"o2_if", "text":"Oxygen only if SpO₂ < 94%", "required": False, "tag":"OXYGEN_JUDICIOUS"},
+            {"id":"delay_trop", "text":"Wait for hs-troponin before ECG", "contra": "heavy"},
+            {"id":"discharge", "text":"Discharge now with GP review", "contra": "heavy"}
+        ]
     },
-    "history_items": [
-        "Red flags: diaphoresis/SOB/syncope", "Character: radiation/exertion/relief",
-        "Risk: CAD risks/family hx"
-    ],
-    "history_desired_order": [
-        "Red flags: diaphoresis/SOB/syncope", "Character: radiation/exertion/relief",
-        "Risk: CAD risks/family hx"
-    ],
-    "history_review_tag": "ACS_RED_FLAGS_FIRST",
-
-    "focused_exam": "Gen: clammy, anxious. JVP not elevated. Lungs: bibasal crackles. CVS: tachy, no loud murmur. Periphery: cool.",
-    
-    # ECG interpretation (structured checklist → points; confidence too)
+    "targeted_history": {
+        "prompt": "Pick up to 3 high-yield history prompts to ask first (limit = 3):",
+        "limit": 3,
+        "items": [
+            {"id":"redflags", "text":"Red flags: diaphoresis/SOB/syncope", "required": True, "tag":"HIST_RED_FLAGS"},
+            {"id":"char", "text":"Characterise pain: radiation/exertion/relief", "required": True, "tag":"HIST_CHARACTER"},
+            {"id":"risk", "text":"Risk: CAD risks/family hx", "required": False, "tag":"HIST_RISK"},
+            {"id":"medlist", "text":"Medications/allergies", "required": False},
+            {"id":"pleuritic", "text":"Is it pleuritic/positional only?", "required": False}
+        ]
+    },
+    "focused_exam": {
+        "prompt": "Choose exam manoeuvres to perform immediately:",
+        "items": [
+            {"id":"obs", "text":"Repeat vitals (trend HR, BP, RR, SpO₂)", "required": True, "tag":"EXAM_OBS"},
+            {"id":"lung", "text":"Auscultate lungs (crackles, wheeze)", "required": True, "tag":"EXAM_LUNGS"},
+            {"id":"cv", "text":"Cardiac exam (murmurs, S3, perfusion)", "required": True, "tag":"EXAM_CV"},
+            {"id":"abd", "text":"Abdominal exam", "required": False},
+            {"id":"neuro", "text":"Neurologic screen", "required": False}
+        ]
+    },
     "ecg_read": {
         "prompt": "ECG interpretation (tick all that apply):",
         "checklist": [
@@ -223,45 +212,33 @@ CASE_CARDIO = {
             {"id":"lbbb", "text":"New LBBB likely", "contra": True},
             {"id":"normal", "text":"Normal ECG", "contra": True}
         ],
-        "review_tag_correct": "ECG_ISCHAEMIA_RECOGNITION"
+        "review_tag_correct":"ECG_ISCHAEMIA_RECOGNITION"
     },
-
-    # Initial order-set (judgment: include all appropriate; exclude unsafe)
-    "initial_orders": {
-        "prompt": "Initial orders (select all appropriate now):",
-        "orders": [
-            {"id":"asp", "text":"Aspirin loading dose (if no contraindication)", "required": True},
-            {"id":"nitr", "text":"Sublingual GTN if pain and BP adequate", "required": True},
-            {"id":"ox", "text":"Oxygen to target SpO₂ > 94% only if hypoxic", "required": False},
-            {"id":"cxr", "text":"Portable CXR (within 30–60 min)", "required": True},
-            {"id":"morph", "text":"Morphine for refractory pain (judicious)", "required": False},
-            {"id":"throm", "text":"Empiric thrombolysis immediately for all", "contra": True},
-            {"id":"dsch", "text":"Discharge now with GP follow-up", "contra": True}
-        ],
-        "review_tags": {
-            "required":"ACS_INITIAL_BUNDLE",
-            "contra":"ACS_AVOID_UNSAFE"
-        }
+    "order_set": {
+        "prompt": "Initial order-set (select what to start now):",
+        "items": [
+            {"id":"aspirin", "text":"Aspirin loading (if no contraindication)", "required": True, "tag":"ASPIRIN"},
+            {"id":"gtn", "text":"Sublingual GTN if pain and BP adequate", "required": True, "tag":"GTN"},
+            {"id":"tele", "text":"Telemetry/obs charting", "required": True, "tag":"TELEMETRY"},
+            {"id":"cxr", "text":"Portable CXR (next 30–60 min)", "required": True, "tag":"CXR"},
+            {"id":"thrombolyse_all", "text":"Empiric thrombolysis for everyone", "contra":"heavy"},
+            {"id":"discharge_now", "text":"Discharge now", "contra":"heavy"}
+        ]
     },
-
-    # Labs review (reasoning about what matters now)
-    "labs_review": {
+    "labs_reasoning": {
         "table": [
             ("Hb", "141 g/L"), ("Plt", "220 x10^9/L"), ("Na", "139 mmol/L"), ("K", "3.6 mmol/L"),
             ("Cr", "82 µmol/L"), ("eGFR", ">90 mL/min"), ("Glucose", "5.8 mmol/L"),
             ("hs-TnT (0h)", "12 ng/L (ULN ~14)"), ("D-dimer", "Not indicated")
         ],
-        "question": "Which statements are most appropriate now?",
+        "question": "Select the most appropriate statements:",
         "options": [
-            {"id":"trend", "text":"Serial troponins are required despite non-diagnostic baseline", "correct": True, "tag":"TROPONIN_SERIAL"},
-            {"id":"ddimer", "text":"D-dimer should be sent first-line in chest pain", "contra": True},
-            {"id":"renal", "text":"Renal function acceptable for contrast if needed", "correct": True, "tag":"RENAL_OK"},
-            {"id":"glucose", "text":"Glucose 5.8 suggests DKA driving pain", "contra": True}
-        ],
-        "points_full": XP_POLICY["labs_reasoning_full"]
+            {"id":"trend", "text":"Serial hs-troponins are required despite non-diagnostic baseline", "correct": True, "tag":"TROPONIN_SERIAL"},
+            {"id":"renal_ok", "text":"Renal function acceptable for contrast if needed", "correct": True, "tag":"RENAL_OK"},
+            {"id":"ddimer_first", "text":"D-dimer should be sent first-line in typical ACS pain", "contra": True},
+            {"id":"glucose_dka", "text":"Glucose 5.8 suggests DKA as the cause", "contra": True}
+        ]
     },
-
-    # Imaging panel (overlay toggles; requires /static/cxr_sample.jpg)
     "imaging_panel": {
         "prompt": "Review the portable CXR (toggle overlays):\n- Silhouette borders\n- Costophrenic angles\n- Cardiomediastinal contour",
         "checklist": [
@@ -272,59 +249,33 @@ CASE_CARDIO = {
         ],
         "review_tag_correct":"CXR_SYSTEMATIC_READ"
     },
-
-    "investigations": {
-        "prompt": "Best next investigation to complement ECG and guide pathway?",
-        "options": [
-            {"id":"A","text":"Serial hs-troponins at appropriate intervals","correct":True,"review_tag":"ACS_TROPONIN_SERIAL"},
-            {"id":"B","text":"D-dimer first line"},
-            {"id":"C","text":"CT brain"},
-            {"id":"D","text":"ESR and bone profile only"}
-        ],
-        "state_if_correct": {"note":"Serial troponins ordered per pathway.","vitals_delta":{"HR":-3, "RR":-1}},
-        "state_if_wrong": {"note":"Work-up less targeted; risk persists.","vitals_delta":{"HR":+4, "RR":+1}},
-        "dangerous_choices": []
-    },
-
-    "nbs": {
-        "prompt": "Next best step now?",
-        "options": [
-            {"id":"A","text":"Start oral antibiotics"},
-            {"id":"B","text":"Pathway-based ACS risk stratification + antiplatelet","correct":True,"review_tag":"ACS_PATHWAY_ANTIPLATELET"},
-            {"id":"C","text":"Immediate discharge with GP follow-up"},
-            {"id":"D","text":"MRI for everyone urgently"}
-        ],
-        "state_if_correct": {"note":"Antiplatelet given; telemetry monitoring.","vitals_delta":{"HR":-5,"RR":-1}},
-        "state_if_wrong": {"note":"Management delayed; risk increases.","vitals_delta":{"HR":+6,"RR":+2}},
-        "dangerous_choices": ["C"]
-    },
-
-    "handoff": {
-        "prompt": "Registrar hand-off essentials (select all you would communicate):",
+    "plan_builder": {
+        "prompt": "Plan (select all that apply now):",
         "items": [
-            {"id":"time", "text":"Time of symptom onset & ECG timing", "required": True},
-            {"id":"red", "text":"Current red flags/hemodynamics", "required": True},
-            {"id":"tx", "text":"Therapies given (aspirin/GTN) & response", "required": True},
-            {"id":"risk", "text":"Pretest risk & plan for serial troponins", "required": True},
-            {"id":"dsch", "text":"Plan for immediate discharge now", "contra": True}
-        ],
-        "review_tags": {"required":"HANDOFF_STRUCTURE", "contra":"DISCHARGE_UNSAFE"}
+            {"id":"acs_pathway", "text":"Pathway-based ACS risk stratification + serial hs-troponins", "required": True, "tag":"ACS_PATHWAY"},
+            {"id":"analgesia", "text":"Analgesia judiciously (avoid masking red flags)", "required": False},
+            {"id":"cardiology_call", "text":"Discuss with cardiology registrar if dynamic ECG or ongoing pain", "required": True, "tag":"ESCALATE_CARDIO"},
+            {"id":"dsch", "text":"Discharge home now", "contra": "heavy"}
+        ]
     },
-
+    "handoff": {
+        "prompt": "Handoff essentials to the registrar (select all essentials):",
+        "items": [
+            {"id":"time", "text":"Symptom onset time & ECG timing", "required": True, "tag":"HANDOFF_TIMES"},
+            {"id":"hemo", "text":"Hemodynamics & current red flags", "required": True, "tag":"HANDOFF_HEMO"},
+            {"id":"tx", "text":"Therapies given (aspirin/GTN) & response", "required": True, "tag":"HANDOFF_TX"},
+            {"id":"risk", "text":"Risk stratification plan & serial troponins schedule", "required": True, "tag":"HANDOFF_PLAN"},
+            {"id":"discharge", "text":"Plan immediate discharge now", "contra": "moderate"}
+        ]
+    },
     "feedback": {
         "rationale_html": """
-        <p><b>Judgment priorities in AUS ED chest pain:</b> ECG within 10 minutes; symptom-to-ECG & symptom-to-treatment times matter.
-        Interpret ECG for ischaemia (ST depression/anterior leads here). Apply a pathway with serial high-sensitivity troponins, give indicated antiplatelet therapy, and monitor. 
-        Oxygen only if hypoxic. Use a structured CXR read to exclude immediate threats (PTX, wide mediastinum) and assess for congestion.</p>
+        <p><b>Why your judgment sequence matters:</b> In AUS ED chest pain, time-to-ECG and pathway entry are critical.
+        ECG within 10 minutes guides immediate risk. Systematic ECG reading catches ischaemia beyond classic STEMI.
+        Start an appropriate order-set (aspirin, GTN if BP adequate, telemetry, early CXR), and commit to serial hs-troponins.
+        Oxygen is for hypoxia, not routine. Clear, structured handoff prevents delays and unsafe discharge.</p>
         """,
-        "takeaways": [
-            "ECG ≤10 min; document times; escalate if dynamic changes.",
-            "ACS ≠ STEMI only: ST-depression + symptoms are high-risk.",
-            "Order-set thinking: aspirin, GTN (if BP ok), telemetry, serial troponins, CXR.",
-            "Use systematic CXR/ECG reads; avoid shotgun tests with low yield (e.g., routine D-dimer).",
-            "Clear handoff: onset time, red flags, therapies, pathway plan."
-        ],
-        "anz_ref": "Aligned with common AU ED/ACS pathways (ECG ≤10 min; pathway-based assessment)."
+        "anz_ref": "Aligned with AUS ED/ACS pathways (ECG ≤10 min; pathway-based assessment)."
     }
 }
 
@@ -345,21 +296,13 @@ BASE_HEAD = """
 """
 
 HOME_HTML = """
-<!doctype html><html><head>""" + BASE_HEAD + """<title>Enzo — Clinical Judgment Trainer</title></head>
+<!doctype html><html><head>""" + BASE_HEAD + """<title>MedBud</title></head>
 <body class="min-h-screen bg-gradient-to-br from-sky-500 via-indigo-500 to-emerald-500 text-white p-4">
   <div class="w-full max-w-4xl mx-auto bg-white/15 backdrop-blur-md rounded-2xl p-6 shadow-xl">
-    <div class="flex items-center justify-between">
-      <h1 class="text-3xl font-extrabold">Enzo — Clinical Judgment Trainer</h1>
-      <form method="post" action="{{ url_for('save_profile') }}" class="flex gap-2 items-center">
-        <input name="user_name" value="{{ user_name }}" placeholder="Your name" class="text-black rounded-lg px-2 py-1" />
-        <input name="rotation" value="{{ rotation }}" placeholder="Rotation" class="text-black rounded-lg px-2 py-1" />
-        <button class="px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-600">Save</button>
-      </form>
-    </div>
-    <p class="opacity-90 mt-1">Short, realistic reps that train <b>what you do next</b>. Confidence-calibrated. Coached with hints. AUS context.</p>
+    <h1 class="text-3xl font-extrabold">MedBud</h1>
+    <p class="opacity-90 mt-1">Daily judgment reps for clinical years. AUS context. Built for <b>action-first</b> decisions.</p>
 
     <div class="flex flex-wrap gap-2 my-4">
-      <span class="px-3 py-1 rounded-full bg-white/20">👤 {{ user_name or "Guest" }} • {{ rotation }}</span>
       <span class="px-3 py-1 rounded-full bg-white/20">🔥 Streak: {{ streak }}</span>
       <span class="px-3 py-1 rounded-full bg-white/20">⭐ XP: {{ xp }}</span>
       <span class="px-3 py-1 rounded-full bg-white/20">📅 Today: {{ cases_today }} case(s)</span>
@@ -389,17 +332,18 @@ HOME_HTML = """
       </div>
 
       <div class="bg-white/10 rounded-xl p-4">
-        <h3 class="font-bold">Scoring at a glance</h3>
+        <h3 class="font-bold">What this trains</h3>
         <ul class="list-disc ml-5 opacity-90 text-sm">
-          <li>Judgment > MCQ: structured ECG & order-set, labs reasoning, ranking</li>
-          <li>Confidence calibration (0–10 per decision)</li>
-          <li>Speed bonus (+5 ≤8m; +3 ≤12m), safety caps, dangerous malus</li>
+          <li>Immediate actions & order-sets (not trivia)</li>
+          <li>Structured ECG/CXR reads</li>
+          <li>Plan + escalation thresholds</li>
+          <li>Registrar handoff discipline</li>
         </ul>
       </div>
     </form>
 
     <div class="mt-6 bg-white/10 rounded-xl p-4">
-      <h3 class="font-bold">Cardio Learning Outcomes this case can cover</h3>
+      <h3 class="font-bold">Cardio Learning Outcomes covered</h3>
       <ul class="list-disc ml-5 opacity-90">
         {% for o in curriculum_outcomes %}<li>{{ o }}</li>{% endfor %}
       </ul>
@@ -409,7 +353,7 @@ HOME_HTML = """
 """
 
 CASE_SHELL = """
-<!doctype html><html><head>""" + BASE_HEAD + """<title>{{ title }}</title></head>
+<!doctype html><html><head>""" + BASE_HEAD + """<title>{{ title }} — MedBud</title></head>
 <body class="min-h-screen bg-slate-900 text-slate-100 p-4">
   <div class="max-w-5xl mx-auto">
     <div class="flex items-center justify-between mb-3">
@@ -421,7 +365,6 @@ CASE_SHELL = """
       <div class="md:col-span-2 bg-slate-800/70 rounded-xl p-4">
         <div class="text-sm">Stage {{ stage_num }} / {{ stage_total }}</div>
         <div class="mt-1 text-slate-200 font-semibold">{{ stage_label }}</div>
-        {% if review_targets %}<div class="mt-2 text-xs text-amber-300">🎯 Targeting weak spot(s): {{ review_targets|join(', ') }}</div>{% endif %}
       </div>
       <div class="bg-slate-800/70 rounded-xl p-4">
         <div class="font-bold mb-1">Vitals</div>
@@ -465,13 +408,6 @@ CASE_SHELL = """
       </div>
       {% endif %}
 
-      <div class="bg-rose-900/30 border border-rose-700/50 rounded-lg p-3">
-        <div class="font-semibold mb-1">AUS escalation cues — when to call the registrar</div>
-        <ul class="list-disc ml-5 text-sm">
-          {% for e in escalation_cues %}<li>{{ e }}</li>{% endfor %}
-        </ul>
-      </div>
-
       <div class="flex gap-2">
         <a href="{{ url_for('home') }}" class="px-4 py-2 rounded-lg bg-slate-700">Quit</a>
         <button name="action" value="continue" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold">Continue</button>
@@ -482,10 +418,10 @@ CASE_SHELL = """
 """
 
 FEEDBACK_HTML = """
-<!doctype html><html><head>""" + BASE_HEAD + """<title>Feedback</title></head>
+<!doctype html><html><head>""" + BASE_HEAD + """<title>Feedback — MedBud</title></head>
 <body class="min-h-screen bg-gradient-to-br from-emerald-50 to-sky-50 text-slate-900 p-4">
   <div class="max-w-4xl mx-auto bg-white rounded-2xl shadow p-5">
-    <h2 class="text-2xl font-extrabold">Case Feedback</h2>
+    <h2 class="text-2xl font-extrabold">Attending Feedback</h2>
     <div class="flex flex-wrap gap-2 my-3">
       <span class="px-3 py-1 rounded-full bg-emerald-100 text-emerald-900">Score: {{ score }} / 100</span>
       <span class="px-3 py-1 rounded-full bg-indigo-100 text-indigo-900">🔥 Streak: {{ streak }}</span>
@@ -494,45 +430,38 @@ FEEDBACK_HTML = """
 
     <div class="grid gap-4">
       <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">Why this matters</h3>
+        <h3 class="font-bold mb-1">Global Rationale (AUS)</h3>
         <div class="prose max-w-none">{{ rationale|safe }}</div>
         <p class="text-sm text-slate-600 mt-2 italic">{{ anz_ref }}</p>
       </div>
 
+      <!-- Stage-by-stage attending-style feedback -->
+      {% for section in sections %}
       <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">Takeaways</h3>
-        <ul class="list-disc ml-6">
-          {% for t in takeaways %}<li>{{ t }}</li>{% endfor %}
-        </ul>
+        <h3 class="font-bold">{{ section.title }}</h3>
+        <p class="mt-1"><b>What you did:</b> {{ section.did }}</p>
+        {% if section.missed %}<p class="mt-1 text-rose-700"><b>Critical misses:</b> {{ section.missed }}</p>{% endif %}
+        {% if section.unsafe %}<p class="mt-1 text-rose-700"><b>Unsafe choices:</b> {{ section.unsafe }}</p>{% endif %}
+        {% if section.attending %}<p class="mt-1"><b>Attending comment:</b> {{ section.attending }}</p>{% endif %}
       </div>
+      {% endfor %}
 
       <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">Calibration</h3>
-        <ul class="list-disc ml-6">
-          <li>Priority: {{ calib.priority }} / 10</li>
-          <li>ECG checklist: {{ calib.ecg }} / 10</li>
-          <li>Investigations: {{ calib.investigations }} / 10</li>
-          <li>NBS: {{ calib.nbs }} / 10</li>
-          <li><b>Avg:</b> {{ calib_avg }} / 10</li>
-        </ul>
-      </div>
-
-      <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">Learning Outcomes covered (Cardio)</h3>
+        <h3 class="font-bold">Learning Outcomes covered (Cardio)</h3>
         <ul class="list-disc ml-6">
           {% for o in curriculum_outcomes %}<li>{{ o }}</li>{% endfor %}
         </ul>
       </div>
 
       <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">AUS escalation cues — when to call the registrar</h3>
+        <h3 class="font-bold">AUS escalation cues — when to call the registrar</h3>
         <ul class="list-disc ml-6">
           {% for e in escalation_cues %}<li>{{ e }}</li>{% endfor %}
         </ul>
       </div>
 
       <div class="bg-slate-50 border rounded-xl p-4">
-        <h3 class="font-bold mb-1">XP Breakdown</h3>
+        <h3 class="font-bold">XP Breakdown</h3>
         <ul class="list-disc ml-6 text-sm">
           {% for line in xp_breakdown %}<li>{{ line }}</li>{% endfor %}
         </ul>
@@ -558,15 +487,14 @@ FEEDBACK_HTML = """
 def _stage_name(key):
     return {
         "presenting":"Presenting Problem",
-        "priority":"Immediate Priority",
-        "history_rank":"Targeted History (Prioritise 1→3)",
+        "immediate_actions":"Immediate Actions",
+        "targeted_history":"Targeted History (pick ≤3)",
         "focused_exam":"Focused Exam",
-        "ecg_read":"ECG Interpretation",
-        "initial_orders":"Initial Orders",
-        "labs_review":"Lab Review & Reasoning",
+        "ecg_read":"ECG Checklist",
+        "order_set":"Initial Order-Set",
+        "labs_reasoning":"Lab Review & Reasoning",
         "imaging_panel":"Imaging Panel (CXR overlays)",
-        "investigations":"Investigations",
-        "nbs":"Next Best Step",
+        "plan_builder":"Plan Builder",
         "handoff":"Registrar Handoff"
     }.get(key, key)
 
@@ -575,19 +503,6 @@ def _apply_vitals_delta(vitals: dict, delta: dict):
     for k,v in (delta or {}).items():
         if isinstance(v, (int, float)) and isinstance(out.get(k), (int, float)):
             out[k] = out.get(k, 0) + v
-    return out
-
-def _hint_block(stage_key, used, hints):
-    costs = XP_POLICY["hint_costs"]
-    out = "<div class='mt-3 p-3 bg-indigo-950/40 rounded-lg'>"
-    for i in range(used):
-        out += f"<div class='text-indigo-200 mb-1'>💡 {hints[i]}</div>"
-    if used < len(hints):
-        cost = costs[min(used, len(costs)-1)]
-        out += f"<button name='action' value='hint_{stage_key}' class='mt-2 px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 font-bold'>Get Hint (–{cost} XP)</button>"
-    else:
-        out += "<div class='text-indigo-300 opacity-80'>No more hints.</div>"
-    out += "</div>"
     return out
 
 def _checklist(name, items, prev):
@@ -610,330 +525,262 @@ def _table_html(rows):
 # ======================= Routes =======================
 @app.route("/", methods=["GET"])
 def home():
-    case = CASE_CARDIO
     return render_template_string(
         HOME_HTML,
-        user_name=session.get("user_name",""),
-        rotation=session.get("rotation","Cardiology"),
         streak=session.get("streak",0),
         xp=session.get("xp",0),
         cases_today=session.get("cases_completed_today",0),
         due_count=queued_spaced_count(),
         due_tags=due_spaced_tags(limit=4),
-        curriculum_outcomes=case["curriculum_outcomes"]
+        curriculum_outcomes=CASE["curriculum_outcomes"]
     )
-
-@app.route("/profile", methods=["POST"])
-def save_profile():
-    session["user_name"] = request.form.get("user_name","").strip()
-    session["rotation"]  = request.form.get("rotation","").strip() or "Cardiology"
-    return redirect(url_for("home"))
 
 @app.route("/start", methods=["POST"])
 def start_case():
-    session["block"] = request.form.get("block","Cardiology")
     review_prefill = request.form.get("review_prefill","").strip()
     review_targets = [t for t in review_prefill.split("|") if t] if review_prefill else due_spaced_tags(limit=4)
-    case = CASE_CARDIO  # only cardio defined for now
-
     session["case"] = {
-        "id": case["id"], "flow": case["flow"][:], "stage_idx": 0,
+        "id": CASE["id"], "flow": CASE["flow"][:], "stage_idx": 0,
         "score": 0, "xp_earned": 0, "start_ts": time.time(),
-        "hints_used": {"priority":0, "investigations":0, "nbs":0, "ecg_read":0, "initial_orders":0, "labs_review":0},
-        "decisions": {}, "vitals": dict(case["vitals_initial"]),
-        "xp_lines": [], "wrong_mcq_count": 0, "review_targets": review_targets or []
+        "decisions": {}, "vitals": dict(CASE["vitals_initial"]),
+        "xp_lines": [], "safety_caps": set(), "contra_flags": [], "review_targets": review_targets or []
     }
-    log_event("start_case", topic=",".join(case["systems"]), qid=case["id"], from_review=1 if review_targets else 0)
+    log_event("start_case", topic=",".join(CASE["systems"]), qid=CASE["id"], from_review=1 if review_targets else 0)
     return redirect(url_for("stage"))
 
 def _render_stage(state):
-    case = CASE_CARDIO
     key = state["flow"][state["stage_idx"]]
     body = ""
     if key == "presenting":
-        body = f"<div class='bg-slate-800/60 rounded-xl p-4'><p class='text-lg'>{case['presenting']}</p></div>"
-    elif key == "priority":
-        data = case["priority"]; opts = ""
-        for o in data["options"]:
-            opts += f"<label class='block bg-slate-800 p-3 rounded-lg mb-2'><input required type='radio' name='choice' value='{o['id']}' class='mr-2 accent-indigo-500'> {o['id']}) {o['text']}</label>"
-        used = state["hints_used"]["priority"]; hint_block = _hint_block("priority", used, data.get("hints",[]))
-        prev_conf = state["decisions"].get("priority",{}).get("conf",50)
-        body = f"<p class='mb-2'>{data['prompt']}</p>{opts}<div class='mt-3 p-3 bg-slate-800 rounded-lg'><label class='block font-semibold mb-1'>Confidence (0–100%)</label><input type='range' min='0' max='100' value='{prev_conf}' name='confidence' class='w-full'></div>{hint_block}"
-    elif key == "history_rank":
-        items = case["history_items"]
-        def dd(name):
-            s = f"<select required name='{name}' class='text-black rounded-lg p-2 mr-2'>"
-            s += "<option value=''>-- select --</option>"
-            for it in items: s += f"<option value='{it}'>{it}</option>"
-            s += "</select>"; return s
-        body = f"""
-        <p class='mb-2'>Prioritise your first 3 history questions (1 = most urgent/impactful):</p>
-        <div class='bg-slate-800 p-3 rounded-lg'>
-          <div class='mb-2'><b>Rank 1:</b> {dd('rank1')}</div>
-          <div class='mb-2'><b>Rank 2:</b> {dd('rank2')}</div>
-          <div class='mb-2'><b>Rank 3:</b> {dd('rank3')}</div>
-          <div class='text-sm opacity-80 mt-2'>Tip: red flags → character → risk context.</div>
-        </div>"""
+        body = f"<div class='bg-slate-800/60 rounded-xl p-4'><p class='text-lg'>{CASE['presenting']}</p></div>"
+    elif key == "immediate_actions":
+        items = CASE["immediate_actions"]["items"]
+        prev = state["decisions"].get("immediate_actions",{}).get("ticks",[])
+        body = f"<p class='mb-2'>{CASE['immediate_actions']['prompt']}</p>" + _checklist("imm_tick", items, prev)
+    elif key == "targeted_history":
+        items = CASE["targeted_history"]["items"]
+        prev = state["decisions"].get("targeted_history",{}).get("ticks",[])
+        limit = CASE["targeted_history"]["limit"]
+        body = f"<p class='mb-2'>{CASE['targeted_history']['prompt']}</p>" + _checklist("hist_tick", items, prev)
+        body += f"<div class='text-xs opacity-70 mt-2'>Select up to {limit}.</div>"
     elif key == "focused_exam":
-        body = "<p class='mb-2'>Focused exam & context:</p><div class='bg-slate-800 p-3 rounded-lg'>" + case.get('focused_exam','') + "</div>"
-        pr = state["decisions"].get("priority")
-        if pr: body += "<div class='mt-3 bg-indigo-900/40 p-3 rounded-lg'><b>Update:</b> " + pr.get("note","") + "</div>"
+        items = CASE["focused_exam"]["items"]
+        prev = state["decisions"].get("focused_exam",{}).get("ticks",[])
+        body = f"<p class='mb-2'>{CASE['focused_exam']['prompt']}</p>" + _checklist("exam_tick", items, prev)
     elif key == "ecg_read":
-        ecg = case["ecg_read"]
-        prev = state["decisions"].get("ecg_read",{}).get("ticks",[])
+        ecg = CASE["ecg_read"]; prev = state["decisions"].get("ecg_read",{}).get("ticks",[])
         body = f"<p class='mb-2'>{ecg['prompt']}</p>" + _checklist("ecg_tick", ecg["checklist"], prev)
-        used = state["hints_used"]["ecg_read"]
-        body += _hint_block("ecg_read", used, ["Nudge: focus on rate, rhythm, ST segments in V4–V6 here."])
         body += "<div class='text-xs opacity-70 mt-2'>We score by required picks chosen and contraindicated picks avoided.</div>"
-    elif key == "initial_orders":
-        io = case["initial_orders"]; prev = state["decisions"].get("initial_orders",{}).get("ticks",[])
-        body = f"<p class='mb-2'>{io['prompt']}</p>" + _checklist("orders_tick", io["orders"], prev)
-        body += "<div class='text-xs opacity-70 mt-2'>Include what helps immediately; avoid unsafe blanket thrombolysis or premature discharge.</div>"
-        body += _hint_block("initial_orders", state["hints_used"]["initial_orders"], ["Clue: aspirin, GTN (if BP ok), telemetry, serial trops, CXR."])
-    elif key == "labs_review":
-        lr = case["labs_review"]; prev = state["decisions"].get("labs_review",{}).get("ticks",[])
+    elif key == "order_set":
+        items = CASE["order_set"]["items"]; prev = state["decisions"].get("order_set",{}).get("ticks",[])
+        body = f"<p class='mb-2'>{CASE['order_set']['prompt']}</p>" + _checklist("order_tick", items, prev)
+    elif key == "labs_reasoning":
+        lr = CASE["labs_reasoning"]; prev = state["decisions"].get("labs_reasoning",{}).get("ticks",[])
         body = "<h3 class='font-bold'>Key labs</h3>" + _table_html(lr["table"])
         body += f"<p class='mt-3 mb-2'>{lr['question']}</p>" + _checklist("labs_tick", lr["options"], prev)
-        body += _hint_block("labs_review", state["hints_used"]["labs_review"], ["Nudge: non-diagnostic baseline hs-trop still needs serials."])
     elif key == "imaging_panel":
-        ip = case["imaging_panel"]; prev = state["decisions"].get("imaging_panel",{}).get("ticks",[])
+        ip = CASE["imaging_panel"]; prev = state["decisions"].get("imaging_panel",{}).get("ticks",[])
         body = f"<p class='mb-2 whitespace-pre-line'>{ip['prompt']}</p>" + _checklist("img_tick", ip["checklist"], prev)
-    elif key == "investigations":
-        inv = case["investigations"]; opts=""
-        for o in inv["options"]:
-            opts += f"<label class='block bg-slate-800 p-3 rounded-lg mb-2'><input required type='radio' name='choice' value='{o['id']}' class='mr-2 accent-indigo-500'> {o['id']}) {o['text']}</label>"
-        used = state["hints_used"]["investigations"]; hint_block = _hint_block("investigations", used, ["Clue: pathway-based serial hs-troponins."])
-        prev_conf = state["decisions"].get("investigations",{}).get("conf",50)
-        body = f"<p class='mb-2'>{inv['prompt']}</p>{opts}<div class='mt-3 p-3 bg-slate-800 rounded-lg'><label class='block font-semibold mb-1'>Confidence (0–100%)</label><input type='range' min='0' max='100' value='{prev_conf}' name='confidence' class='w-full'></div>{hint_block}"
-    elif key == "nbs":
-        nbs = case["nbs"]; opts=""
-        for o in nbs["options"]:
-            opts += f"<label class='block bg-slate-800 p-3 rounded-lg mb-2'><input required type='radio' name='choice' value='{o['id']}' class='mr-2 accent-indigo-500'> {o['id']}) {o['text']}</label>"
-        used = state["hints_used"]["nbs"]; hint_block = _hint_block("nbs", used, ["Clue: antiplatelet + telemetry + risk stratification."])
-        prev_conf = state["decisions"].get("nbs",{}).get("conf",50)
-        body = f"<p class='mb-2'>{nbs['prompt']}</p>{opts}<div class='mt-3 p-3 bg-slate-800 rounded-lg'><label class='block font-semibold mb-1'>Confidence (0–100%)</label><input type='range' min='0' max='100' value='{prev_conf}' name='confidence' class='w-full'></div>{hint_block}"
+    elif key == "plan_builder":
+        items = CASE["plan_builder"]["items"]; prev = state["decisions"].get("plan_builder",{}).get("ticks",[])
+        body = f"<p class='mb-2'>{CASE['plan_builder']['prompt']}</p>" + _checklist("plan_tick", items, prev)
     elif key == "handoff":
-        ho = case["handoff"]; prev = state["decisions"].get("handoff",{}).get("ticks",[])
-        body = f"<p class='mb-2'>Handoff content (AUS registrar): select all essentials.</p>" + _checklist("handoff_tick", ho["items"], prev)
+        items = CASE["handoff"]["items"]; prev = state["decisions"].get("handoff",{}).get("ticks",[])
+        body = f"<p class='mb-2'>{CASE['handoff']['prompt']}</p>" + _checklist("handoff_tick", items, prev)
     return key, body
+
+def _score_required_contra(ticks, items, full_points, section_title, state, review_tag_ok=None):
+    """Generic scorer: full_points if all required chosen and no contra.
+       Heavy malus for unsafe. Missing required triggers safety cap."""
+    ids_req = [i["id"] for i in items if i.get("required")]
+    ids_contra_heavy = [i["id"] for i in items if i.get("contra") == "heavy"]
+    ids_contra_moderate = [i["id"] for i in items if i.get("contra") == "moderate"]
+
+    missing = [i for i in ids_req if i not in ticks]
+    unsafe_heavy = [i for i in ids_contra_heavy if i in ticks]
+    unsafe_moderate = [i for i in ids_contra_moderate if i in ticks]
+
+    points = 0
+    # base: only award if all required selected
+    if not missing:
+        points = full_points
+    else:
+        # partial minimal: 1/3 credit if ≥ half of required chosen and none unsafe
+        have = len(ids_req) - len(missing)
+        if have >= max(1, len(ids_req)//2) and not unsafe_heavy and not unsafe_moderate:
+            points = max(0, full_points // 3)
+
+    # unsafe penalties
+    if unsafe_heavy:
+        points = max(0, points - XP["contra_malus_heavy"])
+        state["contra_flags"].append((section_title, unsafe_heavy))
+    if unsafe_moderate:
+        points = max(0, points - XP["contra_malus_moderate"])
+        state["contra_flags"].append((section_title, unsafe_moderate))
+
+    # safety cap if missing any required
+    if missing:
+        state["safety_caps"].add(section_title)
+
+    # spaced tags
+    if review_tag_ok:
+        ok = (not missing) and (not unsafe_heavy) and (not unsafe_moderate)
+        upsert_spaced_tag(review_tag_ok, ok)
+
+    return points, missing, unsafe_heavy + unsafe_moderate
 
 @app.route("/stage", methods=["GET","POST"])
 def stage():
     state = session.get("case")
     if not state: return redirect(url_for("home"))
-    case = CASE_CARDIO
     flow = state["flow"]
 
     if request.method == "POST":
         action = request.form.get("action","continue")
         key = flow[state["stage_idx"]]
 
-        # Hints
-        if action.startswith("hint_"):
-            stage_key = action.split("hint_")[-1]
-            if stage_key in state["hints_used"]:
-                used = state["hints_used"][stage_key]
-                costs = XP_POLICY["hint_costs"]
-                if used < len(costs):
-                    cost = costs[min(used, len(costs)-1)]
-                    session["xp"] = max(0, session.get("xp",0) - cost)
-                    state["xp_earned"] -= cost
-                    state["xp_lines"].append(f"-{cost} XP: Hint used ({stage_key}, level {used+1})")
-                    state["hints_used"][stage_key] += 1
-            session["case"] = state
-            return redirect(url_for("stage"))
+        # Handle stage submissions
+        if key == "immediate_actions":
+            ticks = request.form.getlist("imm_tick")
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["immediate_actions"]["items"],
+                XP["immediate_actions_full"], "Immediate Actions", state, review_tag_ok="ACS_ECG_10MIN"
+            )
+            state["score"] += pts; state["xp_earned"] += pts
+            state["xp_lines"].append(f"+{pts} Immediate actions")
+            if missing: upsert_spaced_tag("ACS_MONITOR_IV", False)
+            else: upsert_spaced_tag("ACS_MONITOR_IV", True)
+            state["decisions"]["immediate_actions"] = {"ticks": ticks}
 
-        # Process per stage
-        if key == "priority":
-            choice = request.form.get("choice"); conf = int(request.form.get("confidence",50))
-            data = case["priority"]
-            correct_id = next((o["id"] for o in data["options"] if o.get("correct")), None)
-            correct = (choice == correct_id)
-            if correct:
-                pts = XP_POLICY["priority_correct"]
-                state["score"] += pts; state["xp_earned"] += pts; state["xp_lines"].append(f"+{pts} XP: Correct priority")
-                state["vitals"] = _apply_vitals_delta(state["vitals"], data["state_if_correct"]["vitals_delta"])
-                tag = next((o.get("review_tag") for o in data["options"] if o.get("correct")), None)
-                if tag: upsert_spaced_tag(tag, True)
-                note = data["state_if_correct"]["note"]
-            else:
-                state["decisions"]["safety_cap"] = True
-                state["wrong_mcq_count"] += 1
-                state["xp_lines"].append(f"⚠️ Safety-critical missed: cap {XP_POLICY['safety_wrong_cap']}")
-                state["vitals"] = _apply_vitals_delta(state["vitals"], data["state_if_wrong"]["vitals_delta"])
-                if choice in data.get("dangerous_choices", []):
-                    mal = XP_POLICY["dangerous_choice_malus"]; state["score"] -= mal; state["xp_earned"] -= mal
-                    state["xp_lines"].append(f"-{mal} XP: Dangerous choice")
-                tag = next((o.get("review_tag") for o in data["options"] if o.get("correct")), None)
-                if tag: upsert_spaced_tag(tag, False)
-                note = data["state_if_wrong"]["note"]
-            cal = calibration_points(correct, conf); state["score"] += cal; state["xp_earned"] += cal
-            state["xp_lines"].append(f"+{cal} XP: Calibration (priority)")
-            state["decisions"]["priority"] = {"choice": choice, "correct": correct, "conf": conf, "note": note}
-            log_event("priority_decision", topic=",".join(case["systems"]), qid=case["id"], correct=int(correct), score=state["score"])
+        elif key == "targeted_history":
+            ticks = request.form.getlist("hist_tick")
+            limit = CASE["targeted_history"]["limit"]
+            if len(ticks) > limit:
+                ticks = ticks[:limit]  # enforce limit
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["targeted_history"]["items"],
+                XP["history_select_full"], "Targeted History", state, review_tag_ok="HIST_RED_FLAGS"
+            )
+            state["score"] += pts; state["xp_earned"] += pts
+            state["xp_lines"].append(f"+{pts} Targeted history")
+            state["decisions"]["targeted_history"] = {"ticks": ticks}
 
-        elif key == "history_rank":
-            r1, r2, r3 = request.form.get("rank1"), request.form.get("rank2"), request.form.get("rank3")
-            chosen = [r1,r2,r3]; desired = case["history_desired_order"]
-            pts = 0
-            pts += XP_POLICY["history_rank_points"][1] if r1 == desired[0] else 0
-            pts += XP_POLICY["history_rank_points"][2] if r2 == desired[1] else 0
-            pts += XP_POLICY["history_rank_points"][3] if r3 == desired[2] else 0
-            seen = [c for c in chosen if c]
-            if len(set(seen)) != len(seen):
-                pts -= XP_POLICY["history_dup_malus"]; state["xp_lines"].append(f"-{XP_POLICY['history_dup_malus']} XP: Duplicate/missing history ranking")
-            pts = max(0, min(XP_POLICY["history_max"], pts))
-            state["score"] += pts; state["xp_earned"] += pts; state["xp_lines"].append(f"+{pts} XP: History prioritisation")
-            state["decisions"]["history_rank"] = {"rank1":r1,"rank2":r2,"rank3":r3}
-            upsert_spaced_tag(case["history_review_tag"], r1 == desired[0])
+        elif key == "focused_exam":
+            ticks = request.form.getlist("exam_tick")
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["focused_exam"]["items"],
+                XP["focused_exam_full"], "Focused Exam", state, review_tag_ok="EXAM_OBS"
+            )
+            state["score"] += pts; state["xp_earned"] += pts
+            state["xp_lines"].append(f"+{pts} Focused exam")
+            state["decisions"]["focused_exam"] = {"ticks": ticks}
 
         elif key == "ecg_read":
             ticks = request.form.getlist("ecg_tick")
-            reqs = [i["id"] for i in case["ecg_read"]["checklist"] if i.get("required")]
-            contras = [i["id"] for i in case["ecg_read"]["checklist"] if i.get("contra")]
-            got_reqs = all(r in ticks for r in reqs)
-            picked_contra = any(c in ticks for c in contras)
-            pts = 0
-            if got_reqs: pts += XP_POLICY["ecg_interpretation_full"]
-            if picked_contra: pts -= 5
-            pts = max(0, pts)
+            req = [i["id"] for i in CASE["ecg_read"]["checklist"] if i.get("required")]
+            contra = [i["id"] for i in CASE["ecg_read"]["checklist"] if i.get("contra")]
+            missing = [r for r in req if r not in ticks]
+            picked_contra = [c for c in contra if c in ticks]
+            pts = XP["ecg_read_full"] if not missing and not picked_contra else (XP["ecg_read_full"]//3 if not missing else 0)
+            if picked_contra:
+                pts = max(0, pts - XP["contra_malus_moderate"])
+                state["contra_flags"].append(("ECG Checklist", picked_contra))
+            if missing:
+                state["safety_caps"].add("ECG Checklist")
+            upsert_spaced_tag(CASE["ecg_read"]["review_tag_correct"], not missing and not picked_contra)
             state["score"] += pts; state["xp_earned"] += pts
-            state["xp_lines"].append(f"+{pts} XP: ECG structured read")
-            upsert_spaced_tag(case["ecg_read"]["review_tag_correct"], got_reqs and not picked_contra)
+            state["xp_lines"].append(f"+{pts} ECG read")
             state["decisions"]["ecg_read"] = {"ticks": ticks}
 
-        elif key == "initial_orders":
-            ticks = request.form.getlist("orders_tick")
-            orders = case["initial_orders"]["orders"]
-            required = [o["id"] for o in orders if o.get("required")]
-            contra   = [o["id"] for o in orders if o.get("contra")]
-            pts = 0
-            # reward each required order chosen
-            for r in required:
-                if r in ticks: pts += XP_POLICY["orders_points_required_each"]
-            # penalise unsafe
-            for c in contra:
-                if c in ticks:
-                    pts -= XP_POLICY["orders_malus_contra"]
-                    state["xp_lines"].append(f"-{XP_POLICY['orders_malus_contra']} XP: Unsafe order ({c})")
-            pts = max(0, pts); state["score"] += pts; state["xp_earned"] += pts
-            state["xp_lines"].append(f"+{pts} XP: Initial order-set")
-            upsert_spaced_tag(case["initial_orders"]["review_tags"]["required"], all(r in ticks for r in required))
-            upsert_spaced_tag(case["initial_orders"]["review_tags"]["contra"], not any(c in ticks for c in contra))
-            state["decisions"]["initial_orders"] = {"ticks": ticks}
+        elif key == "order_set":
+            ticks = request.form.getlist("order_tick")
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["order_set"]["items"],
+                XP["order_set_full"], "Order-Set", state, review_tag_ok="ACS_PATHWAY_BUNDLE"
+            )
+            state["score"] += pts; state["xp_earned"] += pts
+            if unsafe: state["xp_lines"].append(f"- unsafe order(s)")
+            state["xp_lines"].append(f"+{pts} Order-set")
+            state["decisions"]["order_set"] = {"ticks": ticks}
 
-        elif key == "labs_review":
+        elif key == "labs_reasoning":
             ticks = request.form.getlist("labs_tick")
-            opts = case["labs_review"]["options"]
+            opts = CASE["labs_reasoning"]["options"]
             correct_ids = [o["id"] for o in opts if o.get("correct")]
             contra_ids  = [o["id"] for o in opts if o.get("contra")]
-            pts = 0
-            if all(cid in ticks for cid in correct_ids): pts += case["labs_review"]["points_full"]
-            if any(c in ticks for c in contra_ids): pts -= 5
-            pts = max(0, pts)
-            state["score"] += pts; state["xp_earned"] += pts; state["xp_lines"].append(f"+{pts} XP: Labs reasoning")
+            missing = [cid for cid in correct_ids if cid not in ticks]
+            unsafe = [c for c in contra_ids if c in ticks]
+            pts = XP["labs_reasoning_full"] if not missing and not unsafe else (XP["labs_reasoning_full"]//3 if not missing else 0)
+            if unsafe:
+                pts = max(0, pts - XP["contra_malus_moderate"])
+                state["contra_flags"].append(("Labs Reasoning", unsafe))
+            if missing:
+                state["safety_caps"].add("Labs Reasoning")
             # spaced tags
             for o in opts:
                 if o.get("tag"):
-                    upsert_spaced_tag(o["tag"], o["id"] in ticks and o.get("correct",False))
-            state["decisions"]["labs_review"] = {"ticks": ticks}
+                    upsert_spaced_tag(o["tag"], o["id"] in ticks and o.get("correct",False) and not unsafe)
+            state["score"] += pts; state["xp_earned"] += pts
+            state["xp_lines"].append(f"+{pts} Labs reasoning")
+            state["decisions"]["labs_reasoning"] = {"ticks": ticks}
 
         elif key == "imaging_panel":
             ticks = request.form.getlist("img_tick")
-            ip = case["imaging_panel"]
+            ip = CASE["imaging_panel"]
             req = [i["id"] for i in ip["checklist"] if i.get("required")]
             contra = [i["id"] for i in ip["checklist"] if i.get("contra")]
-            got = all(r in ticks for r in req)
-            pts = 6 if got else 0
-            if any(c in ticks for c in contra): pts -= 4
-            pts = max(0, pts)
+            missing = [r for r in req if r not in ticks]
+            unsafe = [c for c in contra if c in ticks]
+            pts = XP["imaging_panel_full"] if not missing and not unsafe else (XP["imaging_panel_full"]//3 if not missing else 0)
+            if unsafe:
+                pts = max(0, pts - XP["contra_malus_moderate"])
+                state["contra_flags"].append(("Imaging Panel", unsafe))
+            if missing:
+                state["safety_caps"].add("Imaging Panel")
+            upsert_spaced_tag(ip["review_tag_correct"], not missing and not unsafe)
             state["score"] += pts; state["xp_earned"] += pts
-            state["xp_lines"].append(f"+{pts} XP: CXR panel reasoning")
-            upsert_spaced_tag(ip["review_tag_correct"], got and not any(c in ticks for c in contra))
+            state["xp_lines"].append(f"+{pts} CXR panel")
             state["decisions"]["imaging_panel"] = {"ticks": ticks}
 
-        elif key == "investigations":
-            inv = case["investigations"]; choice = request.form.get("choice"); conf = int(request.form.get("confidence",50))
-            corr = next((o["id"] for o in inv["options"] if o.get("correct")), None)
-            correct = (choice == corr)
-            if correct:
-                pts = XP_POLICY["investigations_correct"]
-                state["score"] += pts; state["xp_earned"] += pts; state["xp_lines"].append(f"+{pts} XP: Correct investigation")
-                state["vitals"] = _apply_vitals_delta(state["vitals"], inv["state_if_correct"]["vitals_delta"])
-                upsert_spaced_tag("ACS_TROPONIN_SERIAL", True)
-            else:
-                state["wrong_mcq_count"] += 1
-                state["vitals"] = _apply_vitals_delta(state["vitals"], inv["state_if_wrong"]["vitals_delta"])
-                if choice in inv.get("dangerous_choices", []):
-                    mal = XP_POLICY["dangerous_choice_malus"]; state["score"] -= mal; state["xp_earned"] -= mal
-                    state["xp_lines"].append(f"-{mal} XP: Dangerous investigation")
-                upsert_spaced_tag("ACS_TROPONIN_SERIAL", False)
-            cal = calibration_points(correct, conf); state["score"] += cal; state["xp_earned"] += cal
-            state["xp_lines"].append(f"+{cal} XP: Calibration (investigations)")
-            state["decisions"]["investigations"] = {"choice": choice, "correct": correct, "conf": conf}
-
-        elif key == "nbs":
-            nbs = case["nbs"]; choice = request.form.get("choice"); conf = int(request.form.get("confidence",50))
-            corr = next((o["id"] for o in nbs["options"] if o.get("correct")), None)
-            correct = (choice == corr)
-            if correct:
-                pts = XP_POLICY["nbs_correct"]; state["score"] += pts; state["xp_earned"] += pts
-                state["xp_lines"].append(f"+{pts} XP: Correct next step")
-                state["vitals"] = _apply_vitals_delta(state["vitals"], nbs["state_if_correct"]["vitals_delta"])
-                upsert_spaced_tag("ACS_PATHWAY_ANTIPLATELET", True)
-            else:
-                state["wrong_mcq_count"] += 1
-                state["vitals"] = _apply_vitals_delta(state["vitals"], nbs["state_if_wrong"]["vitals_delta"])
-                if choice in nbs.get("dangerous_choices", []):
-                    mal = XP_POLICY["dangerous_choice_malus"]; state["score"] -= mal; state["xp_earned"] -= mal
-                    state["xp_lines"].append(f"-{mal} XP: Dangerous next step")
-                upsert_spaced_tag("ACS_PATHWAY_ANTIPLATELET", False)
-            cal = calibration_points(correct, conf); state["score"] += cal; state["xp_earned"] += cal
-            state["xp_lines"].append(f"+{cal} XP: Calibration (NBS)")
-            state["decisions"]["nbs"] = {"choice": choice, "correct": correct, "conf": conf}
+        elif key == "plan_builder":
+            ticks = request.form.getlist("plan_tick")
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["plan_builder"]["items"],
+                XP["plan_builder_full"], "Plan Builder", state, review_tag_ok="ACS_PATHWAY"
+            )
+            state["score"] += pts; state["xp_earned"] += pts
+            state["xp_lines"].append(f"+{pts} Plan builder")
+            state["decisions"]["plan_builder"] = {"ticks": ticks}
 
         elif key == "handoff":
             ticks = request.form.getlist("handoff_tick")
-            items = case["handoff"]["items"]
-            required = [i["id"] for i in items if i.get("required")]
-            contra   = [i["id"] for i in items if i.get("contra")]
-            good = all(r in ticks for r in required)
-            bad  = any(c in ticks for c in contra)
-            pts = 6 if good else 0
-            if bad: pts -= 4
-            pts = max(0, pts)
+            pts, missing, unsafe = _score_required_contra(
+                ticks, CASE["handoff"]["items"],
+                XP["handoff_full"], "Handoff", state, review_tag_ok="HANDOFF_DISCIPLINE"
+            )
             state["score"] += pts; state["xp_earned"] += pts
-            state["xp_lines"].append(f"+{pts} XP: Handoff structure")
-            upsert_spaced_tag(case["handoff"]["review_tags"]["required"], good)
-            upsert_spaced_tag(case["handoff"]["review_tags"]["contra"], not bad)
+            state["xp_lines"].append(f"+{pts} Handoff")
             state["decisions"]["handoff"] = {"ticks": ticks}
 
         # advance
         state["stage_idx"] += 1
         session["case"] = state
 
-        # If finished flow -> feedback
+        # end?
         if state["stage_idx"] >= len(flow):
-            # Speed bonus
+            # speed bonus
             elapsed = time.time() - state["start_ts"]
-            if elapsed <= 8*60: sb = XP_POLICY["speed_bonus_fast"]
-            elif elapsed <= 12*60: sb = XP_POLICY["speed_bonus_ok"]
+            if elapsed <= 8*60: sb = XP["speed_bonus_fast"]
+            elif elapsed <= 12*60: sb = XP["speed_bonus_ok"]
             else: sb = 0
             if sb:
-                state["score"] += sb; state["xp_earned"] += sb; state["xp_lines"].append(f"+{sb} XP: Speed bonus")
+                state["score"] += sb; state["xp_earned"] += sb; state["xp_lines"].append(f"+{sb} Speed bonus")
 
-            # Apply caps
-            if state["decisions"].get("safety_cap"):
-                state["xp_lines"].append(f"Score capped at {XP_POLICY['safety_wrong_cap']} (safety-critical miss)")
-                state["score"] = min(state["score"], XP_POLICY["safety_wrong_cap"])
-            else:
-                wc = state["wrong_mcq_count"]
-                if wc >= 2:
-                    cap = XP_POLICY["two_wrong_cap"]; state["xp_lines"].append(f"Score capped at {cap} (two wrong MCQs)")
-                    state["score"] = min(state["score"], cap)
-                elif wc == 1:
-                    cap = XP_POLICY["one_wrong_cap"]; state["xp_lines"].append(f"Score capped at {cap} (one wrong MCQ)")
-                    state["score"] = min(state["score"], cap)
+            # safety caps → set hard cap
+            if state["safety_caps"]:
+                cap = min(100, CASE.get("safety_cap_override", XP["miss_required_stage_cap"]))
+                state["xp_lines"].append(f"Score capped at {cap} (missed required in: {', '.join(state['safety_caps'])})")
+                state["score"] = min(state["score"], cap)
 
             session["case"] = state
             return redirect(url_for("feedback"))
@@ -942,10 +789,9 @@ def stage():
     key, body = _render_stage(state)
     return render_template_string(
         CASE_SHELL,
-        title=CASE_CARDIO["title"], level=CASE_CARDIO["level"], systems=", ".join(CASE_CARDIO["systems"]),
+        title=CASE["title"], level=CASE["level"], systems=", ".join(CASE["systems"]),
         stage_num=state["stage_idx"]+1, stage_total=len(state["flow"]), stage_label=_stage_name(key),
-        vitals=state["vitals"], body=body, show_imaging=(key=="imaging_panel"),
-        escalation_cues=CASE_CARDIO["escalation_cues"], review_targets=state.get("review_targets", [])
+        vitals=state["vitals"], body=body, show_imaging=(key=="imaging_panel")
     )
 
 @app.route("/feedback", methods=["GET"])
@@ -954,69 +800,171 @@ def feedback():
     if not state: return redirect(url_for("home"))
     score = max(0, min(100, int(round(state["score"]))))
 
-    # Calibration proxies (priority/investigations/nbs) + ECG heuristic (based on got reqs)
-    def cal_of(dec_key):
-        d = state["decisions"].get(dec_key, {})
-        if not d: return 0
-        if dec_key in ("priority", "investigations", "nbs"):
-            return calibration_points(d.get("correct",False), d.get("conf",50))
-        if dec_key == "ecg_read":
-            ticks = d.get("ticks",[])
-            req = [i["id"] for i in CASE_CARDIO["ecg_read"]["checklist"] if i.get("required")]
-            contras = [i["id"] for i in CASE_CARDIO["ecg_read"]["checklist"] if i.get("contra")]
-            got = all(r in ticks for r in req) and not any(c in ticks for c in contras)
-            return 8 if got else 3
-        return 0
+    # Attending-style, per-stage comments
+    sections = []
 
-    calib = {
-        "priority": cal_of("priority"),
-        "ecg": cal_of("ecg_read"),
-        "investigations": cal_of("investigations"),
-        "nbs": cal_of("nbs")
-    }
-    calib_avg = round(sum(calib.values())/4.0, 1)
+    def _mk_section(title, did, missed, unsafe, attending):
+        sections.append({
+            "title": title,
+            "did": did or "—",
+            "missed": ", ".join(missed) if missed else "",
+            "unsafe": ", ".join(unsafe) if unsafe else "",
+            "attending": attending
+        })
 
-    # Badges
-    total_hints = sum(state["hints_used"].values())
-    badges = []
-    if total_hints == 0: badges.append("🏅 No Hints")
-    if (time.time() - state["start_ts"]) <= 8*60: badges.append("⚡ Fast Finish (<8 min)")
-    if calib_avg >= 8: badges.append("🎯 Well-Calibrated")
-    if state["decisions"].get("priority",{}).get("correct"): badges.append("✅ Perfect Priority")
+    d = state["decisions"]
 
-    session["last_run"] = {
-        "score": score, "calib": calib, "calib_avg": calib_avg,
-        "badges": badges, "xp_lines": state["xp_lines"][:], "xp_case": state["xp_earned"]
-    }
+    # Immediate Actions
+    imm = d.get("immediate_actions",{}).get("ticks",[])
+    imm_items = {i["id"]:i for i in CASE["immediate_actions"]["items"]}
+    imm_miss = [i["text"] for i in CASE["immediate_actions"]["items"] if i.get("required") and i["id"] not in imm]
+    imm_unsafe = [imm_items[i]["text"] for i in imm if imm_items.get(i,{}).get("contra")]
+    _mk_section(
+        "Immediate Actions",
+        did=", ".join([imm_items[i]["text"] for i in imm]) or "None",
+        missed=imm_miss,
+        unsafe=imm_unsafe,
+        attending=("ECG ≤10 min and monitor/IV are non-negotiable. Waiting for troponin before ECG or discharging now is unsafe in typical ACS presentation.")
+    )
 
-    # Suggest review tags from wrong decisions
+    # Targeted History
+    th = d.get("targeted_history",{}).get("ticks",[])
+    th_items = {i["id"]:i for i in CASE["targeted_history"]["items"]}
+    th_miss = [i["text"] for i in CASE["targeted_history"]["items"] if i.get("required") and i["id"] not in th]
+    _mk_section(
+        "Targeted History",
+        did=", ".join([th_items[i]["text"] for i in th]) or "None",
+        missed=th_miss,
+        unsafe=[],
+        attending=("Lead with red flags and pain character before background risk; it buys safety and speed. Limit to three to keep the window short.")
+    )
+
+    # Focused Exam
+    fx = d.get("focused_exam",{}).get("ticks",[])
+    fx_items = {i["id"]:i for i in CASE["focused_exam"]["items"]}
+    fx_miss = [i["text"] for i in CASE["focused_exam"]["items"] if i.get("required") and i["id"] not in fx]
+    _mk_section(
+        "Focused Exam",
+        did=", ".join([fx_items[i]["text"] for i in fx]) or "None",
+        missed=fx_miss,
+        unsafe=[],
+        attending=("Trend vitals and listen to lungs/heart immediately; early crackles or perfusion changes shift the plan.")
+    )
+
+    # ECG
+    er = d.get("ecg_read",{}).get("ticks",[])
+    er_map = {i["id"]:i for i in CASE["ecg_read"]["checklist"]}
+    er_miss = [er_map[i]["text"] for i in er_map if er_map[i].get("required") and i not in er]
+    er_unsafe = [er_map[i]["text"] for i in er if er_map[i].get("contra")]
+    _mk_section(
+        "ECG Checklist",
+        did=", ".join([er_map[i]["text"] for i in er]) or "None",
+        missed=er_miss,
+        unsafe=er_unsafe,
+        attending=("Your read should explicitly call out rate, rhythm, and ST changes. Here, ST depression V4–V6 puts this in a high-risk bucket even without STEMI.")
+    )
+
+    # Order-set
+    osel = d.get("order_set",{}).get("ticks",[])
+    os_map = {i["id"]:i for i in CASE["order_set"]["items"]}
+    os_miss = [os_map[i]["text"] for i in os_map if os_map[i].get("required") and i not in osel]
+    os_unsafe = [os_map[i]["text"] for i in osel if os_map[i].get("contra")]
+    _mk_section(
+        "Initial Order-Set",
+        did=", ".join([os_map[i]["text"] for i in osel]) or "None",
+        missed=os_miss,
+        unsafe=os_unsafe,
+        attending=("Start aspirin early (if no contraindication), consider GTN if BP adequate, and monitor on telemetry. Thrombolysis is not blanket therapy.")
+    )
+
+    # Labs
+    lb = d.get("labs_reasoning",{}).get("ticks",[])
+    lb_map = {o["id"]:o for o in CASE["labs_reasoning"]["options"]}
+    lb_miss = [lb_map[i]["text"] for i in lb_map if lb_map[i].get("correct") and i not in lb]
+    lb_unsafe = [lb_map[i]["text"] for i in lb if lb_map[i].get("contra")]
+    _mk_section(
+        "Labs Reasoning",
+        did=", ".join([lb_map[i]["text"] for i in lb]) or "None",
+        missed=lb_miss,
+        unsafe=lb_unsafe,
+        attending=("A non-diagnostic baseline hs-troponin doesn’t exclude ACS—commit to serials. Your renal function appraisal supports safe contrast if needed.")
+    )
+
+    # Imaging
+    im = d.get("imaging_panel",{}).get("ticks",[])
+    im_map = {i["id"]:i for i in CASE["imaging_panel"]["checklist"]}
+    im_miss = [im_map[i]["text"] for i in im_map if im_map[i].get("required") and i not in im]
+    im_unsafe = [im_map[i]["text"] for i in im if im_map[i].get("contra")]
+    _mk_section(
+        "Imaging (CXR)",
+        did=", ".join([im_map[i]["text"] for i in im]) or "None",
+        missed=im_miss,
+        unsafe=im_unsafe,
+        attending=("Read the film systematically. Absence of a widened mediastinum or large PTX matters; note subtle congestion if present.")
+    )
+
+    # Plan
+    pl = d.get("plan_builder",{}).get("ticks",[])
+    pl_map = {i["id"]:i for i in CASE["plan_builder"]["items"]}
+    pl_miss = [pl_map[i]["text"] for i in pl_map if pl_map[i].get("required") and i not in pl]
+    pl_unsafe = [pl_map[i]["text"] for i in pl if pl_map[i].get("contra")]
+    _mk_section(
+        "Plan",
+        did=", ".join([pl_map[i]["text"] for i in pl]) or "None",
+        missed=pl_miss,
+        unsafe=pl_unsafe,
+        attending=("Enter the pathway, schedule serial troponins, and escalate to cardiology with dynamic changes or ongoing pain. Discharge now would be unsafe.")
+    )
+
+    # Handoff
+    ho = d.get("handoff",{}).get("ticks",[])
+    ho_map = {i["id"]:i for i in CASE["handoff"]["items"]}
+    ho_miss = [ho_map[i]["text"] for i in ho_map if ho_map[i].get("required") and i not in ho]
+    ho_unsafe = [ho_map[i]["text"] for i in ho if ho_map[i].get("contra")]
+    _mk_section(
+        "Registrar Handoff",
+        did=", ".join([ho_map[i]["text"] for i in ho]) or "None",
+        missed=ho_miss,
+        unsafe=ho_unsafe,
+        attending=("State times (symptom and ECG), current hemodynamics, what you’ve given and how they responded, and the serial troponin plan.")
+    )
+
+    # Review suggestions (weak tags)
     review_suggestions = []
-    if state["decisions"].get("priority",{}).get("correct") is False:
-        review_suggestions.append("ACS_ECG_10MIN")
-    if state["decisions"].get("investigations",{}).get("correct") is False:
-        review_suggestions.append("ACS_TROPONIN_SERIAL")
-    if state["decisions"].get("nbs",{}).get("correct") is False:
-        review_suggestions.append("ACS_PATHWAY_ANTIPLATELET")
+    for tag in ("ACS_ECG_10MIN","ACS_MONITOR_IV","ECG_ISCHAEMIA_RECOGNITION","ACS_PATHWAY_BUNDLE","TROPONIN_SERIAL","CXR_SYSTEMATIC_READ","ACS_PATHWAY","HANDOFF_DISCIPLINE"):
+        # naive surfacing: if we had a safety cap or obvious miss in related stages, prompt review
+        pass
+    # (We already recorded spaced tags during scoring; here we just present a summary of common ones)
+    if "ECG Checklist" in state["safety_caps"]: review_suggestions.append("ECG_ISCHAEMIA_RECOGNITION")
+    if "Immediate Actions" in state["safety_caps"]: review_suggestions.append("ACS_ECG_10MIN")
+    if "Plan Builder" in state["safety_caps"]: review_suggestions.append("ACS_PATHWAY")
 
-    fb = CASE_CARDIO["feedback"]
-    log_event("case_feedback", topic=",".join(CASE_CARDIO["systems"]), qid=CASE_CARDIO["id"], score=score, total=100, percent=score,
+    fb = CASE["feedback"]
+    log_event("case_feedback", topic=",".join(CASE["systems"]), qid=CASE["id"], score=score, total=100, percent=score,
               from_review=1 if state.get("review_targets") else 0)
 
     return render_template_string(
         FEEDBACK_HTML,
-        score=score, streak=session.get("streak",0), xp=session.get("xp",0),
-        rationale=fb["rationale_html"], takeaways=fb["takeaways"], anz_ref=fb["anz_ref"],
-        calib=type("Obj",(object,),calib)(), calib_avg=calib_avg, badges=badges,
-        xp_breakdown=session["last_run"]["xp_lines"], curriculum_outcomes=CASE_CARDIO["curriculum_outcomes"],
-        escalation_cues=CASE_CARDIO["escalation_cues"], review_suggestions=review_suggestions
+        score=score,
+        streak=session.get("streak",0),
+        xp=session.get("xp",0),
+        rationale=fb["rationale_html"],
+        anz_ref=fb["anz_ref"],
+        sections=sections,
+        curriculum_outcomes=CASE["curriculum_outcomes"],
+        escalation_cues=CASE["escalation_cues"],
+        xp_breakdown=state["xp_lines"],
+        review_suggestions=review_suggestions
     )
 
 @app.route("/finish", methods=["POST"])
 def finish_feedback():
-    last = session.get("last_run", {"score":0, "xp_case":0})
-    session["xp"] = max(0, session.get("xp",0) + int(last.get("xp_case",0)))
+    last = session.get("case", {})
+    xp_earned = last.get("xp_earned", 0)
+    score = int(round(last.get("score", 0)))
+    session["xp"] = max(0, session.get("xp",0) + int(xp_earned))
     maybe_increment_streak_once_today()
-    log_event("case_done", topic=",".join(CASE_CARDIO["systems"]), qid=CASE_CARDIO["id"], score=last.get("score",0), total=100, percent=last.get("score",0))
+    log_event("case_done", topic=",".join(CASE["systems"]), qid=CASE["id"], score=score, total=100, percent=score)
     session.pop("case", None)
     return redirect(url_for("home"))
 
@@ -1033,7 +981,7 @@ def gate():
             return resp
         err = "Incorrect code."
     return render_template_string("""
-    <html><head>""" + BASE_HEAD + """<title>Access</title></head>
+    <html><head>""" + BASE_HEAD + """<title>Access — MedBud</title></head>
     <body class="min-h-screen flex items-center justify-center bg-gradient-to-br from-sky-500 to-indigo-600 text-white">
       <form method="post" class="bg-white/15 backdrop-blur-md p-6 rounded-2xl">
         <div class="flex items-center justify-between mb-2">
